@@ -64,38 +64,35 @@ function rateLimit(req, res, next) {
 }
 
 // ── Gemini API helper ───────────────────────────────────────────────────────
-// Uses Gemini 1.5 Flash — best free tier model for PDF understanding
+// Uses Gemini 1.5 Flash via v1 API (stable, free tier, great PDF support)
 async function callClaude(base64Pdf, prompt) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY not configured on server');
 
-  // Try gemini-1.5-flash first (excellent PDF support), then 2.0-flash as fallback
-  const models = ['gemini-1.5-flash', 'gemini-2.0-flash'];
+  // v1 API for 1.5-flash, v1beta for 2.0-flash
+  const models = [
+    { name: 'gemini-1.5-flash', api: 'v1' },
+    { name: 'gemini-1.5-pro', api: 'v1' },
+    { name: 'gemini-2.0-flash', api: 'v1beta' },
+  ];
 
   let lastError;
-  for (const model of models) {
+  for (const { name, api } of models) {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const url = `https://generativelanguage.googleapis.com/${api}/models/${name}:generateContent?key=${apiKey}`;
+      console.log(`Trying ${name} via ${api}...`);
+
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{
             parts: [
-              {
-                inline_data: {
-                  mime_type: 'application/pdf',
-                  data: base64Pdf
-                }
-              },
+              { inline_data: { mime_type: 'application/pdf', data: base64Pdf } },
               { text: prompt }
             ]
           }],
-          generationConfig: {
-            temperature: 0,
-            maxOutputTokens: 2000,
-            responseMimeType: 'application/json'
-          }
+          generationConfig: { temperature: 0, maxOutputTokens: 2000 }
         })
       });
 
@@ -103,39 +100,46 @@ async function callClaude(base64Pdf, prompt) {
 
       if (!response.ok) {
         const errMsg = data?.error?.message || JSON.stringify(data);
-        console.error(`[${model}] API error ${response.status}:`, errMsg);
-        lastError = new Error(`${model} error: ${errMsg}`);
-        continue; // try next model
+        console.error(`[${name}] ${response.status}: ${errMsg.substring(0, 150)}`);
+        // If quota exceeded, try next model
+        if (response.status === 429 || response.status === 403) {
+          lastError = new Error(`Quota exceeded on ${name}`);
+          continue;
+        }
+        // If model not found, try next
+        if (response.status === 404) {
+          lastError = new Error(`Model ${name} not available`);
+          continue;
+        }
+        lastError = new Error(errMsg);
+        continue;
       }
 
-      // Check for safety blocks
       const candidate = data.candidates?.[0];
       if (candidate?.finishReason === 'SAFETY') {
-        console.warn(`[${model}] Response blocked by safety filter`);
-        lastError = new Error('Safety filter blocked response');
+        lastError = new Error('Safety filter — try a different document');
         continue;
       }
 
       const text = candidate?.content?.parts?.[0]?.text || '';
       if (!text) {
-        console.error(`[${model}] Empty text in response:`, JSON.stringify(data).substring(0, 300));
+        console.error(`[${name}] Empty response body:`, JSON.stringify(data).substring(0, 200));
         lastError = new Error('Empty response from Gemini');
         continue;
       }
 
-      // Parse JSON - strip markdown code fences if present
-      const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+      const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
       const parsed = JSON.parse(clean);
-      console.log(`[${model}] Successfully extracted data`);
+      console.log(`[${name}] Extraction successful`);
       return parsed;
 
     } catch (err) {
-      console.error(`[${model}] Exception:`, err.message);
+      console.error(`[${name}] Exception:`, err.message);
       lastError = err;
     }
   }
 
-  throw lastError || new Error('All Gemini models failed');
+  throw lastError || new Error('All Gemini models failed — check API key quota');
 }
 
 // ── Prompts ─────────────────────────────────────────────────────────────────
