@@ -64,44 +64,78 @@ function rateLimit(req, res, next) {
 }
 
 // ── Gemini API helper ───────────────────────────────────────────────────────
-// Uses Gemini 2.0 Flash (free tier: 15 req/min, 1500 req/day)
+// Uses Gemini 1.5 Flash — best free tier model for PDF understanding
 async function callClaude(base64Pdf, prompt) {
   const apiKey = process.env.GEMINI_API_KEY;
-  const model = 'gemini-2.0-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  if (!apiKey) throw new Error('GEMINI_API_KEY not configured on server');
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{
-        parts: [
-          {
-            inline_data: {
-              mime_type: 'application/pdf',
-              data: base64Pdf
-            }
-          },
-          { text: prompt }
-        ]
-      }],
-      generationConfig: {
-        temperature: 0,
-        maxOutputTokens: 1500,
+  // Try gemini-1.5-flash first (excellent PDF support), then 2.0-flash as fallback
+  const models = ['gemini-1.5-flash', 'gemini-2.0-flash'];
+
+  let lastError;
+  for (const model of models) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              {
+                inline_data: {
+                  mime_type: 'application/pdf',
+                  data: base64Pdf
+                }
+              },
+              { text: prompt }
+            ]
+          }],
+          generationConfig: {
+            temperature: 0,
+            maxOutputTokens: 2000,
+            responseMimeType: 'application/json'
+          }
+        })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        const errMsg = data?.error?.message || JSON.stringify(data);
+        console.error(`[${model}] API error ${response.status}:`, errMsg);
+        lastError = new Error(`${model} error: ${errMsg}`);
+        continue; // try next model
       }
-    })
-  });
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Gemini API error ${response.status}: ${err}`);
+      // Check for safety blocks
+      const candidate = data.candidates?.[0];
+      if (candidate?.finishReason === 'SAFETY') {
+        console.warn(`[${model}] Response blocked by safety filter`);
+        lastError = new Error('Safety filter blocked response');
+        continue;
+      }
+
+      const text = candidate?.content?.parts?.[0]?.text || '';
+      if (!text) {
+        console.error(`[${model}] Empty text in response:`, JSON.stringify(data).substring(0, 300));
+        lastError = new Error('Empty response from Gemini');
+        continue;
+      }
+
+      // Parse JSON - strip markdown code fences if present
+      const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+      const parsed = JSON.parse(clean);
+      console.log(`[${model}] Successfully extracted data`);
+      return parsed;
+
+    } catch (err) {
+      console.error(`[${model}] Exception:`, err.message);
+      lastError = err;
+    }
   }
 
-  const data = await response.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  if (!text) throw new Error('Empty response from Gemini');
-  const clean = text.replace(/```json|```/g, '').trim();
-  return JSON.parse(clean);
+  throw lastError || new Error('All Gemini models failed');
 }
 
 // ── Prompts ─────────────────────────────────────────────────────────────────
@@ -191,39 +225,44 @@ app.post(
     };
 
     try {
+      const ts = () => new Date().toISOString();
+
       // Extract Form 16
       if (files.f16) {
         try {
+          console.log(`[${ts()}] Starting Form 16 extraction, size: ${files.f16[0].size} bytes`);
           const b64 = files.f16[0].buffer.toString('base64');
           results.f16Data = await callClaude(b64, PROMPT_F16);
-          console.log(`[${new Date().toISOString()}] Form 16 extracted successfully`);
+          console.log(`[${ts()}] Form 16 extracted OK:`, JSON.stringify(results.f16Data).substring(0, 100));
         } catch (e) {
-          console.error('Form 16 extraction failed:', e.message);
-          results.warnings.push({ doc: 'Form 16', msg: 'Could not extract — please fill manually' });
+          console.error(`[${ts()}] Form 16 FAILED:`, e.message);
+          results.warnings.push({ doc: 'Form 16', msg: e.message });
         }
       }
 
       // Extract Form 26AS
       if (files.as26) {
         try {
+          console.log(`[${ts()}] Starting 26AS extraction, size: ${files.as26[0].size} bytes`);
           const b64 = files.as26[0].buffer.toString('base64');
           results.as26Data = await callClaude(b64, PROMPT_26AS);
-          console.log(`[${new Date().toISOString()}] Form 26AS extracted successfully`);
+          console.log(`[${ts()}] 26AS extracted OK:`, JSON.stringify(results.as26Data).substring(0, 100));
         } catch (e) {
-          console.error('26AS extraction failed:', e.message);
-          results.warnings.push({ doc: 'Form 26AS', msg: 'Could not extract — please fill manually' });
+          console.error(`[${ts()}] 26AS FAILED:`, e.message);
+          results.warnings.push({ doc: 'Form 26AS', msg: e.message });
         }
       }
 
       // Extract AIS
       if (files.ais) {
         try {
+          console.log(`[${ts()}] Starting AIS extraction, size: ${files.ais[0].size} bytes`);
           const b64 = files.ais[0].buffer.toString('base64');
           results.aisData = await callClaude(b64, PROMPT_AIS);
-          console.log(`[${new Date().toISOString()}] AIS extracted successfully`);
+          console.log(`[${ts()}] AIS extracted OK:`, JSON.stringify(results.aisData).substring(0, 100));
         } catch (e) {
-          console.error('AIS extraction failed:', e.message);
-          results.warnings.push({ doc: 'AIS', msg: 'Could not extract — please fill manually' });
+          console.error(`[${ts()}] AIS FAILED:`, e.message);
+          results.warnings.push({ doc: 'AIS', msg: e.message });
         }
       }
 
