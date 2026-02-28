@@ -1,11 +1,20 @@
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
+const helmet = require('helmet');
+const { rateLimit: expressRateLimit } = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
 const app = express();
+
+// ── Security headers (helmet) ────────────────────────────────────────────────
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' }, // allow CDN assets
+  contentSecurityPolicy: false, // disabled — frontend handles its own CSP
+}));
+
 const PORT = process.env.PORT || 3000;
 
 // ── CORS: allow your GitHub Pages frontend ──────────────────────────────────
@@ -38,30 +47,15 @@ const upload = multer({
   }
 });
 
-// ── Rate limiting (simple in-memory, upgrade to Redis for scale) ───────────
-const rateLimitMap = new Map();
-function rateLimit(req, res, next) {
-  const ip = req.ip || req.connection.remoteAddress;
-  const now = Date.now();
-  const windowMs = 60 * 60 * 1000; // 1 hour
-  const maxRequests = 10; // 10 extractions per hour per IP
-
-  const record = rateLimitMap.get(ip) || { count: 0, resetAt: now + windowMs };
-  if (now > record.resetAt) {
-    record.count = 0;
-    record.resetAt = now + windowMs;
-  }
-  record.count++;
-  rateLimitMap.set(ip, record);
-
-  if (record.count > maxRequests) {
-    return res.status(429).json({
-      error: 'Too many requests. Please try again in an hour.',
-      retryAfter: Math.ceil((record.resetAt - now) / 1000)
-    });
-  }
-  next();
-}
+// ── Rate limiting (express-rate-limit — survives server restarts) ───────────
+const rateLimit = expressRateLimit({
+  windowMs: 60 * 60 * 1000,  // 1 hour window
+  max: 10,                    // 10 extractions per IP per hour
+  standardHeaders: true,      // Return rate limit info in RateLimit-* headers
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again in an hour.' },
+  keyGenerator: (req) => req.ip || req.connection?.remoteAddress || 'unknown',
+});
 
 // ── Gemini API helper ───────────────────────────────────────────────────────
 // Free tier: 1,500 requests/day, resets daily at midnight
