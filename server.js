@@ -70,7 +70,9 @@ async function callClaude(base64Pdf, prompt) {
   if (!apiKey) throw new Error('GEMINI_API_KEY not configured on server');
 
   // gemini-1.5-flash on v1beta is the correct endpoint for free tier
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`;
+  // gemini-2.5-flash: current free tier model as of Feb 2026
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  console.log('Calling gemini-2.5-flash...');
 
   const response = await fetch(url, {
     method: 'POST',
@@ -82,10 +84,7 @@ async function callClaude(base64Pdf, prompt) {
           { text: prompt }
         ]
       }],
-      generationConfig: {
-        temperature: 0,
-        maxOutputTokens: 2000,
-      }
+      generationConfig: { temperature: 0, maxOutputTokens: 2000 }
     })
   });
 
@@ -93,8 +92,8 @@ async function callClaude(base64Pdf, prompt) {
 
   if (!response.ok) {
     const errMsg = data?.error?.message || JSON.stringify(data);
-    console.error(`Gemini error ${response.status}:`, errMsg.substring(0, 200));
-    throw new Error(`Gemini error: ${errMsg}`);
+    console.error('Gemini error', response.status, errMsg.substring(0, 200));
+    throw new Error('Gemini error: ' + errMsg);
   }
 
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -103,8 +102,9 @@ async function callClaude(base64Pdf, prompt) {
     throw new Error('Empty response from Gemini');
   }
 
-  const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+  const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
   return JSON.parse(clean);
+
 }
 
 // ── Prompts ─────────────────────────────────────────────────────────────────
