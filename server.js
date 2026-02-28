@@ -26,7 +26,7 @@ const allowedOrigins = [
 app.use(cors({
   origin: (origin, cb) => {
     // Allow requests with no origin (Postman, curl) or whitelisted origins
-    if (!origin || allowedOrigins.some(o => origin.startsWith(o))) {
+    if (!origin || allowedOrigins.includes(origin)) {
       cb(null, true);
     } else {
       cb(new Error('Not allowed by CORS'));
