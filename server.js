@@ -102,8 +102,23 @@ async function callClaude(base64Pdf, prompt) {
     throw new Error('Empty response from Gemini');
   }
 
-  const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
-  return JSON.parse(clean);
+  // Gemini sometimes wraps JSON in markdown or adds extra text
+  // Extract just the JSON object/array
+  let clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
+  
+  // Find the first { and last } to extract just the JSON object
+  const start = clean.indexOf('{');
+  const end = clean.lastIndexOf('}');
+  if (start !== -1 && end !== -1) {
+    clean = clean.substring(start, end + 1);
+  }
+  
+  try {
+    return JSON.parse(clean);
+  } catch(e) {
+    console.error('JSON parse failed. Raw text:', text.substring(0, 500));
+    throw new Error('Could not parse Gemini response as JSON: ' + e.message);
+  }
 
 }
 
