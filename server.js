@@ -84,7 +84,7 @@ async function callClaude(base64Pdf, prompt) {
           { text: prompt }
         ]
       }],
-      generationConfig: { temperature: 0, maxOutputTokens: 2000 }
+      generationConfig: { temperature: 0, maxOutputTokens: 8192 }
     })
   });
 
