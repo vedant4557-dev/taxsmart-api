@@ -65,12 +65,14 @@ function rateLimit(req, res, next) {
 
 // ── Gemini API helper ───────────────────────────────────────────────────────
 // Free tier: 1,500 requests/day, resets daily at midnight
-async function callClaude(base64Pdf, prompt) {
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function callGemini(base64Pdf, prompt) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY not configured on server');
 
-  // Try models in order — fallback if one is unavailable
-  const MODELS = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
+  // Only use models confirmed working on v1beta free tier
+  const MODELS = ['gemini-2.0-flash', 'gemini-2.5-flash'];
   let lastError = null;
 
   for (const modelName of MODELS) {
@@ -97,11 +99,22 @@ async function callClaude(base64Pdf, prompt) {
       continue;
     }
 
+    if (response.status === 429) {
+      // Quota hit — extract retry delay from response and wait
+      const retryMsg = data?.error?.message || '';
+      const retryMatch = retryMsg.match(/retry.*?(\d+\.?\d*)s/i) || retryMsg.match(/(\d+\.?\d*)\s*second/i);
+      const waitSec = retryMatch ? Math.min(parseFloat(retryMatch[1]) + 1, 15) : 5;
+      console.log(`${modelName} quota hit, waiting ${waitSec}s before next model...`);
+      await sleep(waitSec * 1000);
+      lastError = new Error(`${modelName}: quota exceeded`);
+      continue;
+    }
+
     if (!response.ok) {
       const errMsg = data?.error?.message || JSON.stringify(data);
       console.error(`${modelName} error ${response.status}:`, errMsg.substring(0, 200));
-      lastError = new Error(`Gemini ${modelName} error: ${errMsg}`);
-      continue; // try next model
+      lastError = new Error(`${modelName}: ${errMsg.substring(0, 100)}`);
+      continue;
     }
 
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -223,7 +236,7 @@ app.post(
         try {
           console.log(`[${ts()}] Starting Form 16 extraction, size: ${files.f16[0].size} bytes`);
           const b64 = files.f16[0].buffer.toString('base64');
-          results.f16Data = await callClaude(b64, PROMPT_F16);
+          results.f16Data = await callGemini(b64, PROMPT_F16);
           console.log(`[${ts()}] Form 16 extracted OK:`, JSON.stringify(results.f16Data).substring(0, 100));
         } catch (e) {
           console.error(`[${ts()}] Form 16 FAILED:`, e.message);
@@ -231,12 +244,15 @@ app.post(
         }
       }
 
+      // Small delay between docs to avoid RPM quota spikes
+      if (files.f16) await sleep(3000);
+
       // Extract Form 26AS
       if (files.as26) {
         try {
           console.log(`[${ts()}] Starting 26AS extraction, size: ${files.as26[0].size} bytes`);
           const b64 = files.as26[0].buffer.toString('base64');
-          results.as26Data = await callClaude(b64, PROMPT_26AS);
+          results.as26Data = await callGemini(b64, PROMPT_26AS);
           console.log(`[${ts()}] 26AS extracted OK:`, JSON.stringify(results.as26Data).substring(0, 100));
         } catch (e) {
           console.error(`[${ts()}] 26AS FAILED:`, e.message);
@@ -244,12 +260,14 @@ app.post(
         }
       }
 
+      if (files.as26) await sleep(3000);
+
       // Extract AIS
       if (files.ais) {
         try {
           console.log(`[${ts()}] Starting AIS extraction, size: ${files.ais[0].size} bytes`);
           const b64 = files.ais[0].buffer.toString('base64');
-          results.aisData = await callClaude(b64, PROMPT_AIS);
+          results.aisData = await callGemini(b64, PROMPT_AIS);
           console.log(`[${ts()}] AIS extracted OK:`, JSON.stringify(results.aisData).substring(0, 100));
         } catch (e) {
           console.error(`[${ts()}] AIS FAILED:`, e.message);
