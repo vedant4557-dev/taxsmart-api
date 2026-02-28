@@ -63,28 +63,29 @@ function rateLimit(req, res, next) {
   next();
 }
 
-// ── Claude API helper (Anthropic) ──────────────────────────────────────────
+// ── Gemini API helper ───────────────────────────────────────────────────────
+// Free tier: 1,500 requests/day, resets daily at midnight
 async function callClaude(base64Pdf, prompt) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured on server');
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY not configured on server');
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+  // gemini-1.5-flash on v1beta is the correct endpoint for free tier
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+
+  const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 2000,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64Pdf } },
-          { type: 'text', text: prompt }
+      contents: [{
+        parts: [
+          { inline_data: { mime_type: 'application/pdf', data: base64Pdf } },
+          { text: prompt }
         ]
-      }]
+      }],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: 2000,
+      }
     })
   });
 
@@ -92,12 +93,16 @@ async function callClaude(base64Pdf, prompt) {
 
   if (!response.ok) {
     const errMsg = data?.error?.message || JSON.stringify(data);
-    console.error(`Claude API error ${response.status}:`, errMsg);
-    throw new Error(`Claude API error: ${errMsg}`);
+    console.error(`Gemini error ${response.status}:`, errMsg.substring(0, 200));
+    throw new Error(`Gemini error: ${errMsg}`);
   }
 
-  const text = data.content?.[0]?.text || '';
-  if (!text) throw new Error('Empty response from Claude');
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  if (!text) {
+    console.error('Empty Gemini response:', JSON.stringify(data).substring(0, 300));
+    throw new Error('Empty response from Gemini');
+  }
+
   const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
   return JSON.parse(clean);
 }
@@ -171,7 +176,7 @@ app.post(
     { name: 'ais', maxCount: 1 },
   ]),
   async (req, res) => {
-    if (!process.env.ANTHROPIC_API_KEY) {
+    if (!process.env.GEMINI_API_KEY) {
       return res.status(500).json({ error: 'Server not configured. Contact support.' });
     }
 
@@ -346,7 +351,7 @@ function fmt(n) {
 // ── Start server ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`TaxSmart API running on port ${PORT}`);
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.warn('WARNING: ANTHROPIC_API_KEY not set. Extraction will fail.');
+  if (!process.env.GEMINI_API_KEY) {
+    console.warn('WARNING: GEMINI_API_KEY not set. Extraction will fail.');
   }
 });
