@@ -69,57 +69,64 @@ async function callClaude(base64Pdf, prompt) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY not configured on server');
 
-  // gemini-1.5-flash on v1beta is the correct endpoint for free tier
-  // gemini-2.5-flash: current free tier model as of Feb 2026
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-  console.log('Calling gemini-2.5-flash...');
+  // Try models in order — fallback if one is unavailable
+  const MODELS = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
+  let lastError = null;
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{
-        parts: [
-          { inline_data: { mime_type: 'application/pdf', data: base64Pdf } },
-          { text: prompt }
-        ]
-      }],
-      generationConfig: { temperature: 0, maxOutputTokens: 8192 }
-    })
-  });
+  for (const modelName of MODELS) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+    console.log(`Trying ${modelName}...`);
 
-  const data = await response.json();
+    let response, data;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [
+            { inline_data: { mime_type: 'application/pdf', data: base64Pdf } },
+            { text: prompt }
+          ]}],
+          generationConfig: { temperature: 0, maxOutputTokens: 8192 }
+        })
+      });
+      data = await response.json();
+    } catch (fetchErr) {
+      console.error(`${modelName} fetch error:`, fetchErr.message);
+      lastError = fetchErr;
+      continue;
+    }
 
-  if (!response.ok) {
-    const errMsg = data?.error?.message || JSON.stringify(data);
-    console.error('Gemini error', response.status, errMsg.substring(0, 200));
-    throw new Error('Gemini error: ' + errMsg);
+    if (!response.ok) {
+      const errMsg = data?.error?.message || JSON.stringify(data);
+      console.error(`${modelName} error ${response.status}:`, errMsg.substring(0, 200));
+      lastError = new Error(`Gemini ${modelName} error: ${errMsg}`);
+      continue; // try next model
+    }
+
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    if (!text) {
+      console.error(`${modelName} empty response:`, JSON.stringify(data).substring(0, 200));
+      lastError = new Error(`${modelName}: Empty response`);
+      continue;
+    }
+
+    console.log(`${modelName} OK, length: ${text.length}`);
+    let clean = text.replace(/\`\`\`json/g, '').replace(/\`\`\`/g, '').trim();
+    const start = clean.indexOf('{');
+    const end = clean.lastIndexOf('}');
+    if (start !== -1 && end !== -1) clean = clean.substring(start, end + 1);
+
+    try {
+      return JSON.parse(clean);
+    } catch(e) {
+      console.error(`${modelName} JSON parse error:`, text.substring(0, 300));
+      lastError = new Error(`${modelName}: JSON parse failed`);
+      continue;
+    }
   }
 
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  if (!text) {
-    console.error('Empty Gemini response:', JSON.stringify(data).substring(0, 300));
-    throw new Error('Empty response from Gemini');
-  }
-
-  // Gemini sometimes wraps JSON in markdown or adds extra text
-  // Extract just the JSON object/array
-  let clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
-  
-  // Find the first { and last } to extract just the JSON object
-  const start = clean.indexOf('{');
-  const end = clean.lastIndexOf('}');
-  if (start !== -1 && end !== -1) {
-    clean = clean.substring(start, end + 1);
-  }
-  
-  try {
-    return JSON.parse(clean);
-  } catch(e) {
-    console.error('JSON parse failed. Raw text:', text.substring(0, 500));
-    throw new Error('Could not parse Gemini response as JSON: ' + e.message);
-  }
-
+  throw lastError || new Error('All Gemini models failed');
 }
 
 // ── Prompts ─────────────────────────────────────────────────────────────────
