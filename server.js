@@ -42,30 +42,42 @@ const app = express();
 
 // ── Security headers (helmet) ────────────────────────────────────────────────
 app.use(helmet({
-  crossOriginResourcePolicy: { policy: 'cross-origin' }, // allow CDN assets
-  contentSecurityPolicy: false, // disabled — frontend handles its own CSP
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://www.googletagmanager.com", "https://cdnjs.cloudflare.com"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com"],
+      connectSrc: ["'self'", "https://taxsmart-api.onrender.com", "https://generativelanguage.googleapis.com", "https://api.anthropic.com", "https://www.google-analytics.com"],
+      imgSrc: ["'self'", "data:", "https://www.google-analytics.com"],
+      frameSrc: ["'none'"],
+      objectSrc: ["'none'"],
+    }
+  }
 }));
 
 const PORT = process.env.PORT || 3000;
 
 // ── CORS: allow your GitHub Pages frontend ──────────────────────────────────
-const allowedOrigins = [
-  'https://vedant4557-dev.github.io',
-  'http://localhost:3000',
-  'http://127.0.0.1:5500', // Live Server for local dev
-];
+// CORS origins: set ALLOWED_ORIGINS env var for custom domains
+// e.g. ALLOWED_ORIGINS=https://taxsmart.in,https://www.taxsmart.in
+const defaultOrigins = ['https://vedant4557-dev.github.io','http://localhost:3000','http://127.0.0.1:5500'];
+const envOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()) : [];
+const allowedOrigins = [...new Set([...defaultOrigins, ...envOrigins])];
+
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow requests with no origin (Postman, curl) or whitelisted origins
     if (!origin || allowedOrigins.some(o => origin.startsWith(o))) {
       cb(null, true);
     } else {
+      console.warn(`[CORS] Blocked origin: ${origin}`);
       cb(new Error('Not allowed by CORS'));
     }
   }
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' })); // prevent JSON body DoS attacks
 
 // ── File upload: memory storage (never writes to disk permanently) ──────────
 const storage = multer.memoryStorage();
@@ -91,6 +103,24 @@ const rateLimit = expressRateLimit({
 // ── Gemini API helper ───────────────────────────────────────────────────────
 // Free tier: 1,500 requests/day, resets daily at midnight
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ── Circuit breaker — prevents hammering Gemini when it's clearly down ───────
+// After 5 consecutive failures, short-circuit for 60s before trying again
+const cb = {
+  failures: 0,
+  openUntil: 0,
+  MAX_FAILURES: 5,
+  RESET_MS: 60 * 1000,  // 60 seconds
+  isOpen() { return this.failures >= this.MAX_FAILURES && Date.now() < this.openUntil; },
+  onSuccess() { this.failures = 0; },
+  onFailure() {
+    this.failures++;
+    if (this.failures >= this.MAX_FAILURES) {
+      this.openUntil = Date.now() + this.RESET_MS;
+      console.warn(`[CircuitBreaker] OPEN — Gemini failing, blocking for 60s`);
+    }
+  }
+};
 
 // ── PDF text extraction using Gemini's native PDF support ──────────────────
 // Strategy: First pass — extract raw text only (fast, cheap, ~500 tokens)
@@ -205,7 +235,30 @@ function sanitizeExtraction(obj) {
   return result;
 }
 
+// ── Required field shape check — ensure AI returned the right structure ───────
+const REQUIRED_FIELDS = {
+  f16: ['gross_salary','tds_deducted_form16'],
+  as26: ['total_tds_26as'],
+  ais: ['salary_ais']
+};
+
+function validateShape(data, docType) {
+  const required = REQUIRED_FIELDS[docType] || [];
+  const missing = required.filter(k => !(k in data));
+  if (missing.length > 0) {
+    console.warn(`[Shape] ${docType} missing fields: ${missing.join(', ')} — using defaults`);
+    // Fill missing required fields with 0 rather than failing
+    missing.forEach(k => { data[k] = 0; });
+  }
+  return data;
+}
+
 async function callGemini(base64Pdf, prompt, originalBuffer) {
+  // Circuit breaker check — fail fast if Gemini is clearly down
+  if (cb.isOpen()) {
+    throw new Error('AI service temporarily unavailable (too many recent failures). Please try again in 60 seconds or fill manually.');
+  }
+
   // Check cache first (SHA256 of original PDF buffer)
   if (originalBuffer) {
     const hash = getCacheKey(originalBuffer);
@@ -233,10 +286,18 @@ async function callGemini(base64Pdf, prompt, originalBuffer) {
 
     const result = await callGeminiText(pdfText, prompt);
     if (originalBuffer) cacheSet(getCacheKey(originalBuffer), result);
+    cb.onSuccess(); // reset circuit breaker
     return result;
   } catch(e) {
     console.error('Two-pass failed, trying direct PDF:', e.message);
-    return await callGeminiDirect(base64Pdf, prompt);
+    try {
+      const res = await callGeminiDirect(base64Pdf, prompt);
+      cb.onSuccess();
+      return res;
+    } catch(e2) {
+      cb.onFailure();
+      throw e2;
+    }
   }
 }
 
@@ -369,7 +430,7 @@ app.post(
           validatePDF(files.f16[0].buffer, 'Form 16');
           console.log(`[${ts()}] Starting Form 16 extraction, size: ${files.f16[0].size} bytes`);
           const b64 = files.f16[0].buffer.toString('base64');
-          results.f16Data = await callGemini(b64, PROMPT_F16, files.f16[0].buffer);
+          results.f16Data = validateShape(await callGemini(b64, PROMPT_F16, files.f16[0].buffer), 'f16');
           // PAN masking in logs — never log PAN numbers
 const f16Safe = {...results.f16Data, pan: results.f16Data.pan ? results.f16Data.pan.substring(0,3)+'XXXXXXX' : ''};
 console.log(`[${ts()}] Form 16 extracted OK:`, JSON.stringify(f16Safe).substring(0, 120));
@@ -388,7 +449,7 @@ console.log(`[${ts()}] Form 16 extracted OK:`, JSON.stringify(f16Safe).substring
           validatePDF(files.as26[0].buffer, 'Form 26AS');
           console.log(`[${ts()}] Starting 26AS extraction, size: ${files.as26[0].size} bytes`);
           const b64 = files.as26[0].buffer.toString('base64');
-          results.as26Data = await callGemini(b64, PROMPT_26AS, files.as26[0].buffer);
+          results.as26Data = validateShape(await callGemini(b64, PROMPT_26AS, files.as26[0].buffer), 'as26');
           const as26Safe = {...results.as26Data, pan: results.as26Data.pan ? results.as26Data.pan.substring(0,3)+'XXXXXXX' : ''};
 console.log(`[${ts()}] 26AS extracted OK:`, JSON.stringify(as26Safe).substring(0, 120));
         } catch (e) {
@@ -405,7 +466,7 @@ console.log(`[${ts()}] 26AS extracted OK:`, JSON.stringify(as26Safe).substring(0
           validatePDF(files.ais[0].buffer, 'AIS');
           console.log(`[${ts()}] Starting AIS extraction, size: ${files.ais[0].size} bytes`);
           const b64 = files.ais[0].buffer.toString('base64');
-          results.aisData = await callGemini(b64, PROMPT_AIS, files.ais[0].buffer);
+          results.aisData = validateShape(await callGemini(b64, PROMPT_AIS, files.ais[0].buffer), 'ais');
           console.log(`[${ts()}] AIS extracted OK:`, JSON.stringify(results.aisData).substring(0, 100));
         } catch (e) {
           console.error(`[${ts()}] AIS FAILED:`, e.message);
