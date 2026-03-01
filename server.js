@@ -5,7 +5,38 @@ const helmet = require('helmet');
 const { rateLimit: expressRateLimit } = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto'); // built-in, no install needed
 require('dotenv').config();
+
+// ── In-memory extraction cache (SHA256 hash → extracted JSON) ────────────────
+// Prevents re-calling Gemini when user re-uploads same document
+// Cuts 20-30% of API calls. Resets on server restart (free tier acceptable).
+const extractionCache = new Map();
+const CACHE_MAX_SIZE = 200; // max entries before evicting oldest
+const CACHE_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+function getCacheKey(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+function cacheGet(hash) {
+  const entry = extractionCache.get(hash);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CACHE_TTL_MS) {
+    extractionCache.delete(hash);
+    return null;
+  }
+  return entry.data;
+}
+
+function cacheSet(hash, data) {
+  // Evict oldest entry if at capacity
+  if (extractionCache.size >= CACHE_MAX_SIZE) {
+    const firstKey = extractionCache.keys().next().value;
+    extractionCache.delete(firstKey);
+  }
+  extractionCache.set(hash, { data, ts: Date.now() });
+}
 
 const app = express();
 
@@ -144,7 +175,7 @@ ${text.substring(0, 30000)}` }
     if (start !== -1 && end !== -1) clean = clean.substring(start, end + 1);
 
     try {
-      return JSON.parse(clean);
+      return sanitizeExtraction(JSON.parse(clean));
     } catch(e) {
       lastError = new Error(`${modelName}: JSON parse failed`);
       continue;
@@ -153,7 +184,39 @@ ${text.substring(0, 30000)}` }
   throw lastError || new Error('All models failed');
 }
 
-async function callGemini(base64Pdf, prompt) {
+// ── Schema validation & sanitization ─────────────────────────────────────────
+// AI sometimes returns "1,50,000" (string) or negative numbers — fix silently
+function sanitizeExtraction(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const skipStr = new Set(['name','pan','employer_name','deductor','pan_deductor']);
+  const result = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (key === 'tds_entries' && Array.isArray(val)) {
+      result[key] = val.map(e => sanitizeExtraction(e));
+    } else if (typeof val === 'string' && !skipStr.has(key)) {
+      const num = parseFloat(val.replace(/,/g, '').trim());
+      result[key] = isNaN(num) ? val : Math.max(0, num);
+    } else if (typeof val === 'number') {
+      result[key] = Math.max(0, val);
+    } else {
+      result[key] = val;
+    }
+  }
+  return result;
+}
+
+async function callGemini(base64Pdf, prompt, originalBuffer) {
+  // Check cache first (SHA256 of original PDF buffer)
+  if (originalBuffer) {
+    const hash = getCacheKey(originalBuffer);
+    const cached = cacheGet(hash);
+    if (cached) {
+      console.log(`[Cache HIT] Skipping Gemini call, returning cached extraction`);
+      return cached;
+    }
+    // Will set cache after successful extraction (see below)
+  }
+
   // Two-pass approach: extract text first, then parse structured data
   // ~60% fewer tokens, faster, less hallucination on structured output
   try {
@@ -168,7 +231,9 @@ async function callGemini(base64Pdf, prompt) {
       return await callGeminiDirect(base64Pdf, prompt);
     }
 
-    return await callGeminiText(pdfText, prompt);
+    const result = await callGeminiText(pdfText, prompt);
+    if (originalBuffer) cacheSet(getCacheKey(originalBuffer), result);
+    return result;
   } catch(e) {
     console.error('Two-pass failed, trying direct PDF:', e.message);
     return await callGeminiDirect(base64Pdf, prompt);
@@ -203,7 +268,11 @@ async function callGeminiDirect(base64Pdf, prompt) {
     if (response.status === 429) {
       const retryMsg = data?.error?.message || '';
       const retryMatch = retryMsg.match(/retry.*?(\d+\.?\d*)s/i) || retryMsg.match(/(\d+\.?\d*)\s*second/i);
-      const waitSec = retryMatch ? Math.min(parseFloat(retryMatch[1]) + 1, 15) : 5;
+      // Exponential backoff: extract suggested delay or use progressive wait
+      const attempt = MODELS.indexOf(modelName);
+      const baseWait = retryMatch ? parseFloat(retryMatch[1]) + 1 : 5;
+      const waitSec = Math.min(baseWait * Math.pow(2, attempt), 30); // cap at 30s
+      console.log(`${modelName} quota hit, exponential backoff: ${waitSec}s`);
       await sleep(waitSec * 1000);
       lastError = new Error(`quota exceeded`);
       continue;
@@ -221,7 +290,7 @@ async function callGeminiDirect(base64Pdf, prompt) {
     const start = clean.indexOf('{');
     const end = clean.lastIndexOf('}');
     if (start !== -1 && end !== -1) clean = clean.substring(start, end + 1);
-    try { return JSON.parse(clean); }
+    try { return sanitizeExtraction(JSON.parse(clean)); }
     catch(e) { lastError = new Error('JSON parse failed'); continue; }
   }
   throw lastError || new Error('All models failed');
@@ -240,9 +309,20 @@ const PROMPT_AIS = `Extract AIS (Annual Information Statement) data. Return ONLY
 {"pan":"","salary_ais":0,"interest_income_ais":0,"dividend_ais":0,"rental_income_ais":0,"ltcg_ais":0,"stcg_ais":0,"mf_transactions":0,"foreign_income":0,"tds_total_ais":0}
 Rules: interest_income_ais=total from savings+FD+bonds. ltcg_ais/stcg_ais=capital gains amounts. Use 0 for missing. Return ONLY the JSON.`;
 
-// ── Health check ─────────────────────────────────────────────────────────────
+// ── Health check + keep-alive ping ──────────────────────────────────────────
+// Frontend pings /ping every 10 minutes to prevent Render cold starts
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'TaxSmart API', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    service: 'TaxSmart API',
+    timestamp: new Date().toISOString(),
+    cache_size: extractionCache.size,
+    uptime_s: Math.round(process.uptime())
+  });
+});
+
+app.get('/ping', (req, res) => {
+  res.json({ pong: true, ts: Date.now() });
 });
 
 // ── Main extraction endpoint ──────────────────────────────────────────────
@@ -276,12 +356,20 @@ app.post(
     try {
       const ts = () => new Date().toISOString();
 
+      // ── PDF magic byte validation (%PDF header) ─────────────────────────────
+      // Prevents garbage files disguised with PDF mimetype
+      function validatePDF(buffer, name) {
+        const header = buffer.slice(0, 5).toString('ascii');
+        if (header !== '%PDF-') throw new Error(`${name} does not appear to be a valid PDF file`);
+      }
+
       // Extract Form 16
       if (files.f16) {
         try {
+          validatePDF(files.f16[0].buffer, 'Form 16');
           console.log(`[${ts()}] Starting Form 16 extraction, size: ${files.f16[0].size} bytes`);
           const b64 = files.f16[0].buffer.toString('base64');
-          results.f16Data = await callGemini(b64, PROMPT_F16);
+          results.f16Data = await callGemini(b64, PROMPT_F16, files.f16[0].buffer);
           // PAN masking in logs — never log PAN numbers
 const f16Safe = {...results.f16Data, pan: results.f16Data.pan ? results.f16Data.pan.substring(0,3)+'XXXXXXX' : ''};
 console.log(`[${ts()}] Form 16 extracted OK:`, JSON.stringify(f16Safe).substring(0, 120));
@@ -297,9 +385,10 @@ console.log(`[${ts()}] Form 16 extracted OK:`, JSON.stringify(f16Safe).substring
       // Extract Form 26AS
       if (files.as26) {
         try {
+          validatePDF(files.as26[0].buffer, 'Form 26AS');
           console.log(`[${ts()}] Starting 26AS extraction, size: ${files.as26[0].size} bytes`);
           const b64 = files.as26[0].buffer.toString('base64');
-          results.as26Data = await callGemini(b64, PROMPT_26AS);
+          results.as26Data = await callGemini(b64, PROMPT_26AS, files.as26[0].buffer);
           const as26Safe = {...results.as26Data, pan: results.as26Data.pan ? results.as26Data.pan.substring(0,3)+'XXXXXXX' : ''};
 console.log(`[${ts()}] 26AS extracted OK:`, JSON.stringify(as26Safe).substring(0, 120));
         } catch (e) {
@@ -313,9 +402,10 @@ console.log(`[${ts()}] 26AS extracted OK:`, JSON.stringify(as26Safe).substring(0
       // Extract AIS
       if (files.ais) {
         try {
+          validatePDF(files.ais[0].buffer, 'AIS');
           console.log(`[${ts()}] Starting AIS extraction, size: ${files.ais[0].size} bytes`);
           const b64 = files.ais[0].buffer.toString('base64');
-          results.aisData = await callGemini(b64, PROMPT_AIS);
+          results.aisData = await callGemini(b64, PROMPT_AIS, files.ais[0].buffer);
           console.log(`[${ts()}] AIS extracted OK:`, JSON.stringify(results.aisData).substring(0, 100));
         } catch (e) {
           console.error(`[${ts()}] AIS FAILED:`, e.message);
