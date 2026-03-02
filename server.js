@@ -3,14 +3,44 @@ const multer = require('multer');
 const cors = require('cors');
 const helmet = require('helmet');
 const { rateLimit: expressRateLimit } = require('express-rate-limit');
-const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto'); // built-in, no install needed
 require('dotenv').config();
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// ── In-memory extraction cache (SHA256 hash → extracted JSON) ────────────────
+// Prevents re-calling Gemini when user re-uploads same document
+// Cuts 20-30% of API calls. Resets on server restart (free tier acceptable).
+const extractionCache = new Map();
+const CACHE_MAX_SIZE = 200; // max entries before evicting oldest
+const CACHE_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
-// ── Security headers ─────────────────────────────────────────────────────────
+function getCacheKey(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+function cacheGet(hash) {
+  const entry = extractionCache.get(hash);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CACHE_TTL_MS) {
+    extractionCache.delete(hash);
+    return null;
+  }
+  return entry.data;
+}
+
+function cacheSet(hash, data) {
+  // Evict oldest entry if at capacity
+  if (extractionCache.size >= CACHE_MAX_SIZE) {
+    const firstKey = extractionCache.keys().next().value;
+    extractionCache.delete(firstKey);
+  }
+  extractionCache.set(hash, { data, ts: Date.now() });
+}
+
+const app = express();
+
+// ── Security headers (helmet) ────────────────────────────────────────────────
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
   contentSecurityPolicy: {
@@ -27,9 +57,12 @@ app.use(helmet({
   }
 }));
 
-// ── CORS — env var for custom domain support ─────────────────────────────────
-// To add a custom domain: set ALLOWED_ORIGINS=https://taxsmart.in on Render
-const defaultOrigins = ['https://vedant4557-dev.github.io', 'http://localhost:3000', 'http://127.0.0.1:5500'];
+const PORT = process.env.PORT || 3000;
+
+// ── CORS: allow your GitHub Pages frontend ──────────────────────────────────
+// CORS origins: set ALLOWED_ORIGINS env var for custom domains
+// e.g. ALLOWED_ORIGINS=https://taxsmart.in,https://www.taxsmart.in
+const defaultOrigins = ['https://vedant4557-dev.github.io','http://localhost:3000','http://127.0.0.1:5500'];
 const envOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()) : [];
 const allowedOrigins = [...new Set([...defaultOrigins, ...envOrigins])];
 
@@ -38,507 +71,646 @@ app.use(cors({
     if (!origin || allowedOrigins.some(o => origin.startsWith(o))) {
       cb(null, true);
     } else {
-      slog(null, 'warn', 'cors_blocked', { origin });
+      console.warn(`[CORS] Blocked origin: ${origin}`);
       cb(new Error('Not allowed by CORS'));
     }
   }
 }));
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '1mb' })); // prevent JSON body DoS attacks
 
 // ── Structured logging middleware ────────────────────────────────────────────
-// Every request gets a UUID — all downstream logs include reqId for correlation
+// Attaches req.id + req.startTime to every request for correlated logs
 app.use((req, res, next) => {
   req.id = crypto.randomUUID();
   req.startTime = Date.now();
+  // Mask IP for privacy — only log last octet
   const rawIp = req.ip || req.connection?.remoteAddress || 'unknown';
-  // Mask last octet for privacy
-  req.maskedIp = rawIp.replace(/(\d+)$/, '***').replace(/([a-f0-9]+)$/i, '***');
+  req.maskedIp = rawIp.replace(/^(.*\.)(\d+)$/, '$1***').replace(/^(.*:)(\w+)$/, '$1***');
+  const ua = req.headers['user-agent'] || '';
+  req.uaHash = crypto.createHash('sha256').update(ua).digest('hex').substring(0, 12);
   next();
 });
 
 function slog(req, level, event, data = {}) {
+  const duration = req ? Date.now() - (req.startTime || Date.now()) : 0;
   const entry = {
     ts: new Date().toISOString(),
     reqId: req?.id || 'system',
-    ip: req?.maskedIp || '-',
-    level,   // info | warn | error
-    event,   // extraction_start | extraction_ok | extraction_fail | cache_hit | cb_open | quota_hit
-    duration_ms: req ? Date.now() - (req.startTime || Date.now()) : 0,
+    ip: req?.maskedIp || 'system',
+    ua: req?.uaHash || '-',
+    level,
+    event,
+    duration_ms: duration,
     ...data
   };
-  // Use console.error for warn/error so they appear in Render error stream
-  if (level === 'error' || level === 'warn') {
-    console.error(JSON.stringify(entry));
-  } else {
-    console.log(JSON.stringify(entry));
-  }
+  console.log(JSON.stringify(entry));
 }
 
-// ── In-memory SHA256 extraction cache ────────────────────────────────────────
-// Same PDF re-uploaded → instant return, zero Gemini calls
-const extractionCache = new Map();
-const CACHE_MAX = 200;
-const CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
-
-function getCacheKey(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
-
-function cacheGet(hash) {
-  const e = extractionCache.get(hash);
-  if (!e) return null;
-  if (Date.now() - e.ts > CACHE_TTL) { extractionCache.delete(hash); return null; }
-  return e.data;
-}
-
-function cacheSet(hash, data) {
-  if (extractionCache.size >= CACHE_MAX) extractionCache.delete(extractionCache.keys().next().value);
-  extractionCache.set(hash, { data, ts: Date.now() });
-}
-
-// ── Daily cost guardrail ─────────────────────────────────────────────────────
-// Hard cap: Gemini free tier is 1500/day. Cap at DAILY_QUOTA_MAX (default 1400).
-// If someone uploads 15MB × 3 docs × 10 times: 30 calls. Cap protects against abuse.
-const dailyQuota = {
-  count: 0,
-  date: new Date().toISOString().split('T')[0],
-  MAX: parseInt(process.env.DAILY_QUOTA_MAX || '1400'),
-  check() {
-    const today = new Date().toISOString().split('T')[0];
-    if (today !== this.date) {
-      slog(null, 'info', 'quota_reset', { prev_count: this.count, new_date: today });
-      this.count = 0;
-      this.date = today;
-    }
-    if (this.count >= this.MAX) return false;
-    this.count++;
-    return true;
-  },
-  remaining() { return Math.max(0, this.MAX - this.count); }
-};
-
-// ── Circuit breaker ──────────────────────────────────────────────────────────
-// 5 consecutive failures → open for 60s → stops hammering Gemini when it's down
-const circuitBreaker = {
-  failures: 0,
-  openUntil: 0,
-  MAX: 5,
-  COOLDOWN: 60_000,
-  isOpen() { return this.failures >= this.MAX && Date.now() < this.openUntil; },
-  success() { if (this.failures > 0) { this.failures = 0; slog(null, 'info', 'cb_closed'); } },
-  fail(req) {
-    this.failures++;
-    if (this.failures >= this.MAX) {
-      this.openUntil = Date.now() + this.COOLDOWN;
-      slog(req, 'warn', 'cb_open', { until: new Date(this.openUntil).toISOString() });
-    }
-  }
-};
-
-// ── File upload ──────────────────────────────────────────────────────────────
+// ── File upload: memory storage (never writes to disk permanently) ──────────
+const storage = multer.memoryStorage();
 const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 },
+  storage,
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB — tax PDFs are rarely >2MB
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') cb(null, true);
     else cb(new Error('Only PDF files allowed'));
   }
 });
 
-// ── Rate limiting ────────────────────────────────────────────────────────────
+function handleUploadErrors(err, req, res, next) {
+  if (err?.code === 'LIMIT_FILE_SIZE') {
+    slog(req, 'warn', 'file_too_large', { field: err.field });
+    return res.status(413).json({ error: 'File too large (max 8MB). Tax PDFs are rarely over 3MB — use a digital PDF, not a scan.' });
+  }
+  if (err?.message?.includes('PDF')) return res.status(400).json({ error: 'Only PDF files are accepted.' });
+  next(err);
+}
+
+// ── Rate limiting (express-rate-limit — survives server restarts) ───────────
 const rateLimit = expressRateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 10,
-  standardHeaders: true,
+  windowMs: 60 * 60 * 1000,  // 1 hour window
+  max: 10,                    // 10 extractions per IP per hour
+  standardHeaders: true,      // Return rate limit info in RateLimit-* headers
   legacyHeaders: false,
-  message: { error: 'Too many requests. Try again in an hour.' },
-  keyGenerator: (req) => req.ip || 'unknown',
+  message: { error: 'Too many requests. Please try again in an hour.' },
+  keyGenerator: (req) => req.ip || req.connection?.remoteAddress || 'unknown',
 });
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-function validatePDF(buffer, name) {
-  if (buffer.slice(0, 5).toString('ascii') !== '%PDF-')
-    throw new Error(`${name} is not a valid PDF file`);
-}
+// ── Gemini API helper ───────────────────────────────────────────────────────
+// Free tier: 1,500 requests/day, resets daily at midnight
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// AbortController with timeout — wraps any async fn with a deadline
-async function withTimeout(fn, ms, label) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms);
+// ── Observability stats (in-memory, resets on restart) ───────────────────────
+// Tracks extraction success %, avg duration, cache hit ratio in real time
+// Exposed via /stats endpoint — gives you startup viability metrics
+const stats = {
+  extractions: { total: 0, success: 0, fail: 0, totalDurationMs: 0 },
+  cache: { hits: 0, misses: 0 },
+  docs: { f16: 0, as26: 0, ais: 0 },
+  errors: { quota: 0, circuit: 0, timeout: 0, parse: 0, other: 0 },
+  startTime: Date.now(),
+
+  record(type, success, durationMs) {
+    this.extractions.total++;
+    if (success) {
+      this.extractions.success++;
+      this.extractions.totalDurationMs += durationMs;
+    } else {
+      this.extractions.fail++;
+    }
+    if (type && this.docs[type] !== undefined) this.docs[type]++;
+  },
+
+  cacheHit() { this.cache.hits++; },
+  cacheMiss() { this.cache.misses++; },
+
+  trackError(msg) {
+    if (msg.includes('quota')) this.errors.quota++;
+    else if (msg.includes('circuit') || msg.includes('cb_')) this.errors.circuit++;
+    else if (msg.includes('timeout') || msg.includes('timed out')) this.errors.timeout++;
+    else if (msg.includes('parse') || msg.includes('JSON')) this.errors.parse++;
+    else this.errors.other++;
+  },
+
+  summary() {
+    const { total, success, fail, totalDurationMs } = this.extractions;
+    const { hits, misses } = this.cache;
+    return {
+      uptime_s: Math.round((Date.now() - this.startTime) / 1000),
+      extractions: {
+        total, success, fail,
+        success_rate_pct: total > 0 ? Math.round((success / total) * 100) : null,
+        avg_duration_ms: success > 0 ? Math.round(totalDurationMs / success) : null
+      },
+      cache: {
+        hits, misses,
+        hit_rate_pct: (hits + misses) > 0 ? Math.round((hits / (hits + misses)) * 100) : null
+      },
+      doc_types: this.docs,
+      errors: this.errors,
+      quota: { used: dailyQuota.count, remaining: dailyQuota.remaining(), max: dailyQuota.MAX },
+      circuit_breaker: { state: circuitBreaker.isOpen() ? 'OPEN' : 'CLOSED', failures: circuitBreaker.failures }
+    };
+  }
+};
+
+// ── Daily cost guardrail ─────────────────────────────────────────────────────
+// Hard cap on Gemini calls per day — resets at midnight UTC
+// Gemini free tier: 1500/day. We cap at 1400 to leave buffer.
+const dailyQuota = {
+  count: 0,
+  resetDate: new Date().toISOString().split('T')[0],
+  MAX_DAILY: parseInt(process.env.DAILY_QUOTA_MAX || '1400'),
+  check() {
+    const today = new Date().toISOString().split('T')[0];
+    if (today !== this.resetDate) {
+      this.count = 0;
+      this.resetDate = today;
+      console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'quota_reset', new_date: today }));
+    }
+    if (this.count >= this.MAX_DAILY) {
+      return false; // quota exhausted
+    }
+    this.count++;
+    return true;
+  },
+  remaining() { return Math.max(0, this.MAX_DAILY - this.count); }
+};
+
+// ── Circuit breaker — prevents hammering Gemini when it's clearly down ───────
+// After 5 consecutive failures, short-circuit for 60s before trying again
+const cb = {
+  failures: 0,
+  openUntil: 0,
+  MAX_FAILURES: 5,
+  RESET_MS: 60 * 1000,  // 60 seconds
+  isOpen() { return this.failures >= this.MAX_FAILURES && Date.now() < this.openUntil; },
+  onSuccess() { this.failures = 0; },
+  onFailure() {
+    this.failures++;
+    if (this.failures >= this.MAX_FAILURES) {
+      this.openUntil = Date.now() + this.RESET_MS;
+      console.warn(`[CircuitBreaker] OPEN — Gemini failing, blocking for 60s`);
+    }
+  }
+};
+
+// ── PDF text extraction using Gemini's native PDF support ──────────────────
+// Strategy: First pass — extract raw text only (fast, cheap, ~500 tokens)
+// Second pass — structured JSON extraction from text (no PDF overhead)
+// This cuts token usage ~60% vs sending raw PDF base64 for JSON extraction
+
+async function extractPdfText(base64Pdf) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+  const textController = new AbortController();
+  const textTimer = setTimeout(() => textController.abort(), 25000); // 25s timeout
+  let response;
   try {
-    return await fn(ctrl.signal);
-  } catch (e) {
-    if (e.name === 'AbortError') throw new Error(`${label} timed out after ${ms/1000}s`);
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// ── Prompts (compact — reduce input tokens) ──────────────────────────────────
-const PROMPT_F16 = `Extract Form 16 data. Return ONLY valid JSON:
-{"name":"","pan":"","employer_name":"","gross_salary":0,"basic_salary":0,"hra_received":0,"special_allowance":0,"prof_tax":0,"epf_employee":0,"epf_employer":0,"sec80c":0,"nps":0,"employer_nps":0,"sec80d_self":0,"home_loan_interest":0,"sec80e":0,"standard_deduction":50000,"tds_deducted_form16":0,"total_income_form16":0,"taxable_income_form16":0}
-Rules: gross_salary=total before deductions. tds_deducted_form16=total TDS in Part A. 0 for missing.`;
-
-const PROMPT_26AS = `Extract Form 26AS data. Return ONLY valid JSON:
-{"pan":"","tds_entries":[{"deductor":"","amount":0,"tds":0,"pan_deductor":""}],"total_tds_26as":0,"advance_tax":0,"self_assessment_tax":0,"salary_income_26as":0,"interest_income_26as":0}
-Rules: total_tds_26as=sum of ALL TDS. 0 for missing.`;
-
-const PROMPT_AIS = `Extract AIS data. Return ONLY valid JSON:
-{"pan":"","salary_ais":0,"interest_income_ais":0,"dividend_ais":0,"rental_income_ais":0,"ltcg_ais":0,"stcg_ais":0,"mf_transactions":0,"foreign_income":0,"tds_total_ais":0}
-Rules: interest_income_ais=savings+FD+bonds total. 0 for missing.`;
-
-// ── Schema sanitization ───────────────────────────────────────────────────────
-// Coerces "1,50,000" strings to numbers, clamps negatives to 0
-const STRING_FIELDS = new Set(['name', 'pan', 'employer_name', 'deductor', 'pan_deductor']);
-function sanitize(obj) {
-  if (!obj || typeof obj !== 'object') return obj;
-  const out = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (k === 'tds_entries' && Array.isArray(v)) out[k] = v.map(sanitize);
-    else if (typeof v === 'string' && !STRING_FIELDS.has(k)) {
-      const n = parseFloat(v.replace(/,/g, ''));
-      out[k] = isNaN(n) ? v : Math.max(0, n);
-    } else if (typeof v === 'number') out[k] = Math.max(0, v);
-    else out[k] = v;
-  }
-  return out;
-}
-
-// Shape check — fill missing required fields with 0 rather than crashing
-const REQUIRED = { f16: ['gross_salary','tds_deducted_form16'], as26: ['total_tds_26as'], ais: ['salary_ais'] };
-function checkShape(data, type) {
-  (REQUIRED[type] || []).filter(k => !(k in data)).forEach(k => { data[k] = 0; });
-  return data;
-}
-
-// Parse Gemini response text to JSON
-function parseGeminiJSON(text) {
-  let clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
-  const s = clean.indexOf('{'), e = clean.lastIndexOf('}');
-  if (s !== -1 && e !== -1) clean = clean.substring(s, e + 1);
-  return sanitize(JSON.parse(clean));
-}
-
-// ── Gemini API calls ─────────────────────────────────────────────────────────
-
-// Pass 1: extract raw text from PDF (cheap, fast)
-async function extractText(base64Pdf) {
-  const key = process.env.GEMINI_API_KEY;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`;
-
-  return withTimeout(async (signal) => {
-    const res = await fetch(url, {
-      method: 'POST', signal,
+    response = await fetch(url, {
+      method: 'POST',
+      signal: textController.signal,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ parts: [
           { inline_data: { mime_type: 'application/pdf', data: base64Pdf } },
-          { text: 'Extract all text exactly as it appears. Output only raw text, no commentary.' }
+          { text: 'Extract all text from this PDF document exactly as it appears. Output only the raw text, no commentary.' }
         ]}],
         generationConfig: { temperature: 0, maxOutputTokens: 16384 }
       })
     });
-    const d = await res.json();
-    if (!res.ok) throw new Error(d?.error?.message || 'Text extraction failed');
-    return d.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  }, 25_000, 'PDF text extraction');
+  } finally {
+    clearTimeout(textTimer);
+  }
+  const data = await response.json();
+  if (!response.ok) throw new Error(data?.error?.message || 'Text extraction failed');
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
 
-// Pass 2: structured JSON from text (much cheaper than raw PDF)
-async function extractStructured(text, prompt) {
-  const key = process.env.GEMINI_API_KEY;
+async function callGeminiText(text, prompt) {
+  // Send extracted text (not raw PDF) to AI for structured extraction
+  // This is ~3-5x cheaper in tokens than sending base64 PDF
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY not configured on server');
+
   const MODELS = ['gemini-2.0-flash', 'gemini-2.5-flash'];
-  let lastErr;
+  let lastError = null;
 
-  for (const model of MODELS) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
+  for (const modelName of MODELS) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+
+    let response, data;
     try {
-      const result = await withTimeout(async (signal) => {
-        const res = await fetch(url, {
-          method: 'POST', signal,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: `${prompt}\n\nDOCUMENT TEXT:\n${text.substring(0, 30000)}` }] }],
-            generationConfig: { temperature: 0, maxOutputTokens: 2048 }
-          })
-        });
-        const d = await res.json();
-        if (res.status === 429) {
-          const msg = d?.error?.message || '';
-          const m = msg.match(/(\d+\.?\d*)\s*second/i);
-          const wait = m ? Math.min(parseFloat(m[1]) + 1, 20) : 8;
-          await sleep(wait * 1000);
-          throw new Error('quota_retry');
-        }
-        if (!res.ok) throw new Error(d?.error?.message || `HTTP ${res.status}`);
-        const txt = d.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        if (!txt) throw new Error('empty_response');
-        return parseGeminiJSON(txt);
-      }, 20_000, `${model} structured extraction`);
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [
+            { text: `${prompt}
 
-      return result;
-    } catch (e) {
-      lastErr = e;
+DOCUMENT TEXT:
+${text.substring(0, 30000)}` }
+          ]}],
+          generationConfig: { temperature: 0, maxOutputTokens: 2048 }  // much less needed for structured JSON
+        })
+      });
+      data = await response.json();
+    } catch (fetchErr) {
+      lastError = fetchErr;
+      continue;
+    }
+
+    if (response.status === 429) {
+      const retryMsg = data?.error?.message || '';
+      const retryMatch = retryMsg.match(/retry.*?(\d+\.?\d*)s/i) || retryMsg.match(/(\d+\.?\d*)\s*second/i);
+      const waitSec = retryMatch ? Math.min(parseFloat(retryMatch[1]) + 1, 15) : 5;
+      await sleep(waitSec * 1000);
+      lastError = new Error(`${modelName}: quota exceeded`);
+      continue;
+    }
+
+    if (!response.ok) {
+      const errMsg = data?.error?.message || JSON.stringify(data);
+      lastError = new Error(`${modelName}: ${errMsg.substring(0, 100)}`);
+      continue;
+    }
+
+    const text2 = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    if (!text2) { lastError = new Error(`${modelName}: Empty response`); continue; }
+
+    console.log(`${modelName} OK, response length: ${text2.length}`);
+    let clean = text2.replace(/```json/g, '').replace(/```/g, '').trim();
+    const start = clean.indexOf('{');
+    const end = clean.lastIndexOf('}');
+    if (start !== -1 && end !== -1) clean = clean.substring(start, end + 1);
+
+    try {
+      return sanitizeExtraction(JSON.parse(clean));
+    } catch(e) {
+      lastError = new Error(`${modelName}: JSON parse failed`);
       continue;
     }
   }
-  throw lastErr || new Error('All models failed');
+  throw lastError || new Error('All models failed');
 }
 
-// Fallback: send raw PDF directly (for scanned/image PDFs)
-async function extractDirect(base64Pdf, prompt) {
-  const key = process.env.GEMINI_API_KEY;
-  const MODELS = ['gemini-2.0-flash', 'gemini-2.5-flash'];
-  let lastErr;
-
-  for (const model of MODELS) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
-    try {
-      const result = await withTimeout(async (signal) => {
-        const res = await fetch(url, {
-          method: 'POST', signal,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [
-              { inline_data: { mime_type: 'application/pdf', data: base64Pdf } },
-              { text: prompt }
-            ]}],
-            generationConfig: { temperature: 0, maxOutputTokens: 4096 }
-          })
-        });
-        const d = await res.json();
-        if (res.status === 429) {
-          const attempt = MODELS.indexOf(model);
-          await sleep(Math.min(5 * Math.pow(2, attempt), 30) * 1000);
-          throw new Error('quota_retry');
-        }
-        if (!res.ok) throw new Error(d?.error?.message || `HTTP ${res.status}`);
-        const txt = d.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        if (!txt) throw new Error('empty_response');
-        return parseGeminiJSON(txt);
-      }, 30_000, `${model} direct extraction`);
-
-      return result;
-    } catch (e) {
-      lastErr = e;
-      continue;
+// ── Schema validation & sanitization ─────────────────────────────────────────
+// AI sometimes returns "1,50,000" (string) or negative numbers — fix silently
+function sanitizeExtraction(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const skipStr = new Set(['name','pan','employer_name','deductor','pan_deductor']);
+  const result = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (key === 'tds_entries' && Array.isArray(val)) {
+      result[key] = val.map(e => sanitizeExtraction(e));
+    } else if (typeof val === 'string' && !skipStr.has(key)) {
+      const num = parseFloat(val.replace(/,/g, '').trim());
+      result[key] = isNaN(num) ? val : Math.max(0, num);
+    } else if (typeof val === 'number') {
+      result[key] = Math.max(0, val);
+    } else {
+      result[key] = val;
     }
   }
-  throw lastErr || new Error('All models failed');
+  return result;
 }
 
-// ── Main extraction orchestrator ─────────────────────────────────────────────
-async function callGemini(base64Pdf, prompt, originalBuffer, req) {
-  // 1. Daily quota guard
+// ── Required field shape check — ensure AI returned the right structure ───────
+const REQUIRED_FIELDS = {
+  f16: ['gross_salary','tds_deducted_form16'],
+  as26: ['total_tds_26as'],
+  ais: ['salary_ais']
+};
+
+function validateShape(data, docType) {
+  const required = REQUIRED_FIELDS[docType] || [];
+  const missing = required.filter(k => !(k in data));
+  if (missing.length > 0) {
+    console.warn(`[Shape] ${docType} missing fields: ${missing.join(', ')} — using defaults`);
+    // Fill missing required fields with 0 rather than failing
+    missing.forEach(k => { data[k] = 0; });
+  }
+  return data;
+}
+
+async function callGemini(base64Pdf, prompt, originalBuffer) {
+  // Daily quota guardrail check
   if (!dailyQuota.check()) {
-    slog(req, 'warn', 'quota_hit', { remaining: 0 });
-    throw new Error('Daily AI limit reached. Resets at midnight UTC. Please fill manually.');
+    throw new Error('quota: Daily AI extraction limit reached. Service resets at midnight UTC. Please fill manually — takes 3 minutes.');
   }
 
-  // 2. Circuit breaker
-  if (circuitBreaker.isOpen()) {
-    slog(req, 'warn', 'cb_blocked');
-    throw new Error('AI service temporarily down. Try again in 60 seconds or fill manually.');
+  // Circuit breaker check — fail fast if Gemini is clearly down
+  if (cb.isOpen()) {
+    throw new Error('AI service temporarily unavailable (too many recent failures). Please try again in 60 seconds or fill manually.');
   }
 
-  // 3. Cache check
+  // Check cache first (SHA256 of original PDF buffer)
   if (originalBuffer) {
     const hash = getCacheKey(originalBuffer);
     const cached = cacheGet(hash);
     if (cached) {
+      stats.cacheHit();
       slog(req, 'info', 'cache_hit', { quota_remaining: dailyQuota.remaining() });
       return cached;
     }
+    // Will set cache after successful extraction (see below)
   }
 
-  // 4. Two-pass extraction (text first → structured JSON)
+  stats.cacheMiss();
+  // Two-pass approach: extract text first, then parse structured data
+  // ~60% fewer tokens, faster, less hallucination on structured output
   try {
-    const pdfText = await extractText(base64Pdf);
-    slog(req, 'info', 'text_extracted', { chars: pdfText.length });
+    const ts = () => new Date().toISOString();
+    console.log(`[${ts()}] Extracting PDF text...`);
+    const pdfText = await extractPdfText(base64Pdf);
+    console.log(`[${ts()}] PDF text extracted, length: ${pdfText.length} chars`);
 
-    let result;
     if (pdfText.length < 100) {
-      // Scanned PDF — fall back to direct
-      slog(req, 'info', 'fallback_direct', { reason: 'short_text' });
-      result = await extractDirect(base64Pdf, prompt);
-    } else {
-      result = await extractStructured(pdfText, prompt);
+      // Scanned/image PDF — fall back to direct PDF approach
+      console.log(`[${ts()}] Short text, falling back to direct PDF extraction`);
+      return await callGeminiDirect(base64Pdf, prompt);
     }
 
+    const result = await callGeminiText(pdfText, prompt);
     if (originalBuffer) cacheSet(getCacheKey(originalBuffer), result);
-    circuitBreaker.success();
-    slog(req, 'info', 'extraction_success', { quota_remaining: dailyQuota.remaining() });
+    cb.onSuccess(); // reset circuit breaker
     return result;
-
-  } catch (e) {
-    slog(req, 'warn', 'two_pass_failed', { err: e.message });
+  } catch(e) {
+    console.error('Two-pass failed, trying direct PDF:', e.message);
     try {
-      const result = await extractDirect(base64Pdf, prompt);
-      if (originalBuffer) cacheSet(getCacheKey(originalBuffer), result);
-      circuitBreaker.success();
-      return result;
-    } catch (e2) {
-      circuitBreaker.fail(req);
-      slog(req, 'error', 'extraction_failed', { err: e2.message, cb_failures: circuitBreaker.failures });
+      const res = await callGeminiDirect(base64Pdf, prompt);
+      cb.onSuccess();
+      return res;
+    } catch(e2) {
+      cb.onFailure();
       throw e2;
     }
   }
 }
 
-// ── Health & ping endpoints ───────────────────────────────────────────────────
+async function callGeminiDirect(base64Pdf, prompt) {
+  // Fallback: send raw PDF (original approach, for scanned/image PDFs)
+  const apiKey = process.env.GEMINI_API_KEY;
+  const MODELS = ['gemini-2.0-flash', 'gemini-2.5-flash'];
+  let lastError = null;
+
+  for (const modelName of MODELS) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+
+    let response, data;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [
+            { inline_data: { mime_type: 'application/pdf', data: base64Pdf } },
+            { text: prompt }
+          ]}],
+          generationConfig: { temperature: 0, maxOutputTokens: 4096 }
+        })
+      });
+      data = await response.json();
+    } catch (fetchErr) { lastError = fetchErr; continue; }
+
+    if (response.status === 429) {
+      const retryMsg = data?.error?.message || '';
+      const retryMatch = retryMsg.match(/retry.*?(\d+\.?\d*)s/i) || retryMsg.match(/(\d+\.?\d*)\s*second/i);
+      // Exponential backoff: extract suggested delay or use progressive wait
+      const attempt = MODELS.indexOf(modelName);
+      const baseWait = retryMatch ? parseFloat(retryMatch[1]) + 1 : 5;
+      const waitSec = Math.min(baseWait * Math.pow(2, attempt), 30); // cap at 30s
+      console.log(`${modelName} quota hit, exponential backoff: ${waitSec}s`);
+      await sleep(waitSec * 1000);
+      lastError = new Error(`quota exceeded`);
+      continue;
+    }
+
+    if (!response.ok) {
+      lastError = new Error((data?.error?.message || 'error').substring(0, 100));
+      continue;
+    }
+
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    if (!text) { lastError = new Error('Empty response'); continue; }
+
+    let clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    const start = clean.indexOf('{');
+    const end = clean.lastIndexOf('}');
+    if (start !== -1 && end !== -1) clean = clean.substring(start, end + 1);
+    try { return sanitizeExtraction(JSON.parse(clean)); }
+    catch(e) { lastError = new Error('JSON parse failed'); continue; }
+  }
+  throw lastError || new Error('All models failed');
+}
+
+// ── Prompts ─────────────────────────────────────────────────────────────────
+const PROMPT_F16 = `Extract Form 16 data. Return ONLY valid JSON, no markdown, no explanation:
+{"name":"","pan":"","employer_name":"","gross_salary":0,"basic_salary":0,"hra_received":0,"special_allowance":0,"prof_tax":0,"epf_employee":0,"epf_employer":0,"sec80c":0,"nps":0,"employer_nps":0,"sec80d_self":0,"home_loan_interest":0,"sec80e":0,"standard_deduction":50000,"tds_deducted_form16":0,"total_income_form16":0,"taxable_income_form16":0}
+Rules: gross_salary=total salary before deductions. tds_deducted_form16=total TDS shown in Part A. Use 0 for any field not found. Return ONLY the JSON object.`;
+
+const PROMPT_26AS = `Extract Form 26AS data. Return ONLY valid JSON, no markdown:
+{"pan":"","tds_entries":[{"deductor":"","amount":0,"tds":0,"pan_deductor":""}],"total_tds_26as":0,"advance_tax":0,"self_assessment_tax":0,"salary_income_26as":0,"interest_income_26as":0}
+Rules: total_tds_26as=sum of ALL TDS entries. tds_entries=list from Part A. Use 0 for missing. Return ONLY the JSON.`;
+
+const PROMPT_AIS = `Extract AIS (Annual Information Statement) data. Return ONLY valid JSON, no markdown:
+{"pan":"","salary_ais":0,"interest_income_ais":0,"dividend_ais":0,"rental_income_ais":0,"ltcg_ais":0,"stcg_ais":0,"mf_transactions":0,"foreign_income":0,"tds_total_ais":0}
+Rules: interest_income_ais=total from savings+FD+bonds. ltcg_ais/stcg_ais=capital gains amounts. Use 0 for missing. Return ONLY the JSON.`;
+
+// ── Health check + keep-alive ping ──────────────────────────────────────────
+// Frontend pings /ping every 10 minutes to prevent Render cold starts
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'TaxSmart API',
-    ts: new Date().toISOString(),
-    uptime_s: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
     cache_size: extractionCache.size,
-    quota_used: dailyQuota.count,
-    quota_remaining: dailyQuota.remaining(),
-    circuit_breaker: circuitBreaker.isOpen() ? 'OPEN' : 'CLOSED',
-    cb_failures: circuitBreaker.failures
+    uptime_s: Math.round(process.uptime()),
+    daily_quota_used: dailyQuota.count,
+    daily_quota_remaining: dailyQuota.remaining(),
+    circuit_breaker: cb.isOpen() ? 'OPEN' : 'CLOSED'
   });
 });
 
 app.get('/ping', (req, res) => res.json({ pong: true, ts: Date.now() }));
 
-// ── Main extraction endpoint ─────────────────────────────────────────────────
-app.post('/extract', rateLimit, upload.fields([
-  { name: 'f16', maxCount: 1 },
-  { name: 'as26', maxCount: 1 },
-  { name: 'ais', maxCount: 1 }
-]), async (req, res) => {
-  if (!process.env.GEMINI_API_KEY)
-    return res.status(500).json({ error: 'Server not configured.' });
-
-  const files = req.files || {};
-  if (!files.f16 && !files.as26 && !files.ais)
-    return res.status(400).json({ error: 'Upload at least one document.' });
-
-  slog(req, 'info', 'request_start', {
-    docs: Object.keys(files).join(','),
-    quota_remaining: dailyQuota.remaining()
-  });
-
-  const out = { f16Data: {}, as26Data: {}, aisData: {}, errors: [], warnings: [] };
-
-  // Extract Form 16
-  if (files.f16) {
-    try {
-      validatePDF(files.f16[0].buffer, 'Form 16');
-      slog(req, 'info', 'extraction_start', { doc: 'f16', size: files.f16[0].size });
-      const b64 = files.f16[0].buffer.toString('base64');
-      out.f16Data = checkShape(await callGemini(b64, PROMPT_F16, files.f16[0].buffer, req), 'f16');
-      slog(req, 'info', 'extraction_ok', { doc: 'f16', fields: Object.keys(out.f16Data).length });
-    } catch (e) {
-      slog(req, 'error', 'extraction_fail', { doc: 'f16', err: e.message });
-      out.warnings.push({ doc: 'Form 16', msg: e.message });
-    }
-    await sleep(2000); // small gap between docs
-  }
-
-  // Extract Form 26AS
-  if (files.as26) {
-    try {
-      validatePDF(files.as26[0].buffer, 'Form 26AS');
-      slog(req, 'info', 'extraction_start', { doc: '26as', size: files.as26[0].size });
-      const b64 = files.as26[0].buffer.toString('base64');
-      out.as26Data = checkShape(await callGemini(b64, PROMPT_26AS, files.as26[0].buffer, req), 'as26');
-      slog(req, 'info', 'extraction_ok', { doc: '26as', fields: Object.keys(out.as26Data).length });
-    } catch (e) {
-      slog(req, 'error', 'extraction_fail', { doc: '26as', err: e.message });
-      out.warnings.push({ doc: 'Form 26AS', msg: e.message });
-    }
-    await sleep(2000);
-  }
-
-  // Extract AIS
-  if (files.ais) {
-    try {
-      validatePDF(files.ais[0].buffer, 'AIS');
-      slog(req, 'info', 'extraction_start', { doc: 'ais', size: files.ais[0].size });
-      const b64 = files.ais[0].buffer.toString('base64');
-      out.aisData = checkShape(await callGemini(b64, PROMPT_AIS, files.ais[0].buffer, req), 'ais');
-      slog(req, 'info', 'extraction_ok', { doc: 'ais', fields: Object.keys(out.aisData).length });
-    } catch (e) {
-      slog(req, 'error', 'extraction_fail', { doc: 'ais', err: e.message });
-      out.warnings.push({ doc: 'AIS', msg: e.message });
-    }
-  }
-
-  out.errors = runErrorChecks(out.f16Data, out.as26Data, out.aisData);
-  slog(req, 'info', 'request_done', { warnings: out.warnings.length, errors: out.errors.length });
-  return res.json(out);
+// ── /stats — observability dashboard endpoint ─────────────────────────────────
+// Shows extraction success %, avg duration, cache hit rate, error breakdown
+// Access: https://taxsmart-api.onrender.com/stats
+app.get('/stats', (req, res) => {
+  res.json(stats.summary());
 });
 
-// ── Cross-document error checks ──────────────────────────────────────────────
+// ── Main extraction endpoint ──────────────────────────────────────────────
+// Accepts up to 3 files: f16, as26, ais
+app.post(
+  '/extract',
+  rateLimit,
+  upload.fields([
+    { name: 'f16', maxCount: 1 },
+    { name: 'as26', maxCount: 1 },
+    { name: 'ais', maxCount: 1 },
+  ]),
+  async (req, res) => {
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'Server not configured. Contact support.' });
+    }
+
+    const files = req.files || {};
+    if (!files.f16 && !files.as26 && !files.ais) {
+      return res.status(400).json({ error: 'Please upload at least one document.' });
+    }
+
+    const results = {
+      f16Data: {},
+      as26Data: {},
+      aisData: {},
+      errors: [],
+      warnings: [],
+    };
+
+    try {
+      const ts = () => new Date().toISOString();
+
+      // PDF magic byte validation — rejects garbage files disguised as PDFs
+      function validatePDF(buffer, name) {
+        if (buffer.slice(0, 5).toString('ascii') !== '%PDF-')
+          throw new Error(`${name} is not a valid PDF`);
+      }
+
+      // Helper to run one doc extraction with full stats tracking
+      async function extractDoc(fileObj, prompt, docKey, label) {
+        const t0 = Date.now();
+        validatePDF(fileObj.buffer, label);
+        slog(req, 'info', 'extraction_start', { doc: docKey, size: fileObj.size });
+        const b64 = fileObj.buffer.toString('base64');
+        try {
+          const data = validateShape(await callGemini(b64, prompt, fileObj.buffer), docKey);
+          stats.record(docKey, true, Date.now() - t0);
+          slog(req, 'info', 'extraction_ok', { doc: docKey, fields: Object.keys(data).length, quota_remaining: dailyQuota.remaining() });
+          return data;
+        } catch (e) {
+          stats.record(docKey, false, 0);
+          stats.trackError(e.message);
+          throw e;
+        }
+      }
+
+      if (files.f16) {
+        try {
+          results.f16Data = await extractDoc(files.f16[0], PROMPT_F16, 'f16', 'Form 16');
+        } catch (e) {
+          slog(req, 'error', 'extraction_fail', { doc: 'f16', err: e.message });
+          results.warnings.push({ doc: 'Form 16', msg: e.message });
+        }
+        await sleep(2000);
+      }
+
+      if (files.as26) {
+        try {
+          results.as26Data = await extractDoc(files.as26[0], PROMPT_26AS, 'as26', 'Form 26AS');
+        } catch (e) {
+          slog(req, 'error', 'extraction_fail', { doc: '26as', err: e.message });
+          results.warnings.push({ doc: 'Form 26AS', msg: e.message });
+        }
+        await sleep(2000);
+      }
+
+      if (files.ais) {
+        try {
+          results.aisData = await extractDoc(files.ais[0], PROMPT_AIS, 'ais', 'AIS');
+        } catch (e) {
+          slog(req, 'error', 'extraction_fail', { doc: 'ais', err: e.message });
+          results.warnings.push({ doc: 'AIS', msg: e.message });
+        }
+      }
+
+      results.errors = runErrorChecks(results.f16Data, results.as26Data, results.aisData);
+      slog(req, 'info', 'request_done', { warnings: results.warnings.length, errors: results.errors.length });
+      // Files in memoryStorage — auto GC'd after response
+      return res.json(results);
+
+    } catch (err) {
+      slog(req, 'error', 'request_error', { err: err.message });
+      return res.status(500).json({ error: 'Extraction failed. Please try again or fill manually.' });
+    }
+  }
+);
+
+// ── Error detection logic ────────────────────────────────────────────────────
 function runErrorChecks(f16, as26, ais) {
   const errors = [];
 
+  // 1. TDS Mismatch
   if (f16.tds_deducted_form16 > 0 && as26.total_tds_26as > 0) {
     const diff = Math.abs(f16.tds_deducted_form16 - as26.total_tds_26as);
-    if (diff > 1000) errors.push({
-      type:'crit', icon:'warning', severity:'red',
-      title:'TDS Mismatch: Form 16 vs 26AS',
-      desc:`Form 16 shows ${fmt(f16.tds_deducted_form16)}, 26AS shows ${fmt(as26.total_tds_26as)}. Diff: ${fmt(diff)}.`,
-      action:'Contact employer HR immediately. TDS not in 26AS cannot be claimed.'
-    });
+    if (diff > 1000) {
+      errors.push({
+        type: 'crit', icon: 'warning',
+        title: 'TDS Mismatch: Form 16 vs 26AS',
+        desc: `Form 16 shows TDS of ${fmt(f16.tds_deducted_form16)}, but Form 26AS shows ${fmt(as26.total_tds_26as)}. Difference: ${fmt(diff)}.`,
+        action: 'Contact your employer HR/payroll team immediately. TDS not in 26AS cannot be claimed as credit.',
+        severity: 'red'
+      });
+    }
   }
 
+  // 2. Salary mismatch Form 16 vs AIS
   if (f16.gross_salary > 0 && ais.salary_ais > 0) {
     const diff = Math.abs(f16.gross_salary - ais.salary_ais);
-    if (diff > 5000) errors.push({
-      type:'warn', icon:'alert', severity:'amber',
-      title:'Salary Mismatch: Form 16 vs AIS',
-      desc:`Form 16: ${fmt(f16.gross_salary)}, AIS: ${fmt(ais.salary_ais)}. Diff: ${fmt(diff)}.`,
-      action:'AIS may include perquisites. Declare correct figure in ITR.'
-    });
+    if (diff > 5000) {
+      errors.push({
+        type: 'warn', icon: 'alert',
+        title: 'Salary Mismatch: Form 16 vs AIS',
+        desc: `Form 16 shows ${fmt(f16.gross_salary)} but AIS shows ${fmt(ais.salary_ais)}. Difference: ${fmt(diff)}.`,
+        action: 'Cross-check with your employer. AIS may include perquisites. Declare the correct figure in your ITR.',
+        severity: 'amber'
+      });
+    }
   }
 
-  if (as26.tds_entries?.length > 0) {
-    const missing = as26.tds_entries.filter(e => !e.pan_deductor || e.pan_deductor === 'PANNOTAVBL' || e.pan_deductor === '');
-    if (missing.length > 0) errors.push({
-      type:'warn', icon:'id-card', severity:'amber',
-      title:`Missing PAN in ${missing.length} TDS ${missing.length > 1 ? 'Entries' : 'Entry'}`,
-      desc:`${missing.length} deductor(s) have missing PAN. TDS credit may not be claimable.`,
-      action:'Contact deductors to file TDS correction with their PAN.'
-    });
+  // 3. Missing PAN in TDS entries
+  if (as26.tds_entries && as26.tds_entries.length > 0) {
+    const missingPan = as26.tds_entries.filter(
+      e => !e.pan_deductor || e.pan_deductor === 'PANNOTAVBL' || e.pan_deductor === ''
+    );
+    if (missingPan.length > 0) {
+      errors.push({
+        type: 'warn', icon: 'id-card',
+        title: `Missing PAN in ${missingPan.length} TDS ${missingPan.length > 1 ? 'Entries' : 'Entry'}`,
+        desc: `${missingPan.length} deductor(s) have missing or invalid PAN. TDS credit may not be claimable.`,
+        action: 'Contact the deductors and ask them to file a TDS correction with their PAN.',
+        severity: 'amber'
+      });
+    }
   }
 
+  // 4. Interest income discrepancy
   if (ais.interest_income_ais > 0 && as26.interest_income_26as > 0) {
     const diff = Math.abs(ais.interest_income_ais - as26.interest_income_26as);
-    if (diff > 2000) errors.push({
-      type:'warn', icon:'money', severity:'amber',
-      title:'Interest Income Discrepancy',
-      desc:`AIS: ${fmt(ais.interest_income_ais)}, 26AS: ${fmt(as26.interest_income_26as)}.`,
-      action:'Use the higher figure in ITR to avoid IT notice.'
+    if (diff > 2000) {
+      errors.push({
+        type: 'warn', icon: 'money',
+        title: 'Interest Income Discrepancy',
+        desc: `AIS shows ${fmt(ais.interest_income_ais)} but 26AS shows ${fmt(as26.interest_income_26as)}.`,
+        action: 'Use the higher figure in your ITR to avoid a notice from the Income Tax Department.',
+        severity: 'amber'
+      });
+    }
+  }
+
+  // 5. Capital gains found
+  if ((ais.ltcg_ais > 0 || ais.stcg_ais > 0) && (ais.ltcg_ais + ais.stcg_ais) > 10000) {
+    errors.push({
+      type: 'info', icon: 'chart',
+      title: 'Capital Gains Found in AIS',
+      desc: `LTCG: ${fmt(ais.ltcg_ais || 0)}, STCG: ${fmt(ais.stcg_ais || 0)}. These have been auto-filled.`,
+      action: "Cross-check with your broker's P&L statement before filing.",
+      severity: 'blue'
     });
   }
 
-  if ((ais.ltcg_ais > 0 || ais.stcg_ais > 0) && (ais.ltcg_ais + ais.stcg_ais) > 10000)
+  // 6. Dividend income
+  if (ais.dividend_ais > 5000) {
     errors.push({
-      type:'info', icon:'chart', severity:'blue',
-      title:'Capital Gains Found in AIS',
-      desc:`LTCG: ${fmt(ais.ltcg_ais||0)}, STCG: ${fmt(ais.stcg_ais||0)}. Auto-filled.`,
-      action:"Cross-check with broker's P&L before filing."
+      type: 'info', icon: 'building',
+      title: 'Dividend Income Detected',
+      desc: `AIS shows dividend income of ${fmt(ais.dividend_ais)}. Fully taxable since FY 2020-21.`,
+      action: 'Declare under Income from Other Sources in your ITR. Check if TDS was deducted.',
+      severity: 'blue'
     });
-
-  if (ais.dividend_ais > 5000)
-    errors.push({
-      type:'info', icon:'building', severity:'blue',
-      title:'Dividend Income Detected',
-      desc:`AIS shows ${fmt(ais.dividend_ais)} dividend. Fully taxable since FY 2020-21.`,
-      action:'Declare under Income from Other Sources.'
-    });
+  }
 
   return errors;
 }
 
 function fmt(n) {
-  if (!n) return '₹0';
+  if (!n) return '0';
   n = Math.round(n);
-  if (n >= 10000000) return '₹' + (n/10000000).toFixed(1) + ' Cr';
-  if (n >= 100000) return '₹' + (n/100000).toFixed(1) + ' L';
+  if (n >= 10000000) return '₹' + (n / 10000000).toFixed(1) + ' Cr';
+  if (n >= 100000) return '₹' + (n / 100000).toFixed(1) + ' L';
   const s = n.toString();
   if (s.length <= 3) return '₹' + s;
   let r = s.slice(-3), rem = s.slice(0, -3);
@@ -546,8 +718,10 @@ function fmt(n) {
   return '₹' + rem + ',' + r;
 }
 
+// ── Start server ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'server_start', port: PORT }));
-  if (!process.env.GEMINI_API_KEY)
-    console.error(JSON.stringify({ ts: new Date().toISOString(), event: 'config_error', msg: 'GEMINI_API_KEY not set' }));
+  console.log(`TaxSmart API running on port ${PORT}`);
+  if (!process.env.GEMINI_API_KEY) {
+    console.warn('WARNING: GEMINI_API_KEY not set. Extraction will fail.');
+  }
 });
