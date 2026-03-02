@@ -68,10 +68,17 @@ const allowedOrigins = [...new Set([...defaultOrigins, ...envOrigins])];
 
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || allowedOrigins.some(o => origin.startsWith(o))) {
+    if (!origin) { cb(null, true); return; } // allow server-to-server / curl
+    // SECURITY: exact URL.origin match prevents subdomain bypass
+    // e.g. https://vedant4557-dev.github.io.evil.com would PASS startsWith but FAILS this
+    const isAllowed = allowedOrigins.some(allowed => {
+      try { return new URL(allowed).origin === new URL(origin).origin; }
+      catch { return false; }
+    });
+    if (isAllowed) {
       cb(null, true);
     } else {
-      console.warn(`[CORS] Blocked origin: ${origin}`);
+      console.warn(JSON.stringify({ ts: new Date().toISOString(), event: 'cors_blocked', origin }));
       cb(new Error('Not allowed by CORS'));
     }
   }
@@ -111,7 +118,7 @@ function slog(req, level, event, data = {}) {
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB — tax PDFs are rarely >2MB
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB per file — Indian tax PDFs are never legitimately larger
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') cb(null, true);
     else cb(new Error('Only PDF files allowed'));
@@ -425,43 +432,46 @@ async function callGemini(base64Pdf, prompt, originalBuffer) {
   // Check cache first (SHA256 of original PDF buffer)
   if (originalBuffer) {
     const hash = getCacheKey(originalBuffer);
+    originalBuffer = null; // free buffer RAM immediately after hashing — we only need the hash
     const cached = cacheGet(hash);
     if (cached) {
       stats.cacheHit();
-      // Note: req not in scope here — use structured console.log instead
       console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'cache_hit', quota_remaining: dailyQuota.remaining() }));
       return cached;
     }
+    // Store hash for cache-set after extraction
+    var _cacheHash = hash;
   }
 
   stats.cacheMiss();
   // Two-pass: extract text first (cheap), then parse structured JSON (cheaper than raw PDF)
+  // IMPORTANT: Keep originalBase64 separately so fallback always has it even after we null base64Pdf
+  const originalBase64 = base64Pdf; // preserve for scanned PDF fallback
+
   try {
-    const pdfText = await extractPdfText(base64Pdf);
-    // Immediately free the base64 buffer from memory after text extracted
-    base64Pdf = null;
+    const pdfText = await extractPdfText(originalBase64);
 
     if (pdfText.length < 100) {
-      // Scanned/image PDF — fall back to direct extraction
+      // Scanned/image PDF — fall back to direct extraction using preserved original
       console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'fallback_direct', reason: 'short_text' }));
-      const r = await callGeminiDirect(base64Pdf, prompt);
+      const r = await callGeminiDirect(originalBase64, prompt);
       cb.onSuccess();
+      if (originalBuffer) { cacheSet(getCacheKey(originalBuffer), r); originalBuffer = null; }
       return r;
     }
 
+    // Text-based PDF: structured extraction from text (much cheaper in tokens)
     const result = await callGeminiText(pdfText, prompt);
-    if (originalBuffer) {
-      cacheSet(getCacheKey(originalBuffer), result);
-      originalBuffer = null; // free buffer memory immediately
-    }
+    if (_cacheHash) { cacheSet(_cacheHash, result); }
     cb.onSuccess();
     return result;
   } catch(e) {
+    // Two-pass failed — try direct PDF approach as last resort
     console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'two_pass_failed', err: e.message }));
     try {
-      const r = await callGeminiDirect(base64Pdf, prompt);
+      const r = await callGeminiDirect(originalBase64, prompt); // use originalBase64, never null
       cb.onSuccess();
-      if (originalBuffer) { cacheSet(getCacheKey(originalBuffer), r); originalBuffer = null; }
+      if (_cacheHash) { cacheSet(_cacheHash, r); }
       return r;
     } catch(e2) {
       cb.onFailure();
