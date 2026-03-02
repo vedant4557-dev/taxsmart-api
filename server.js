@@ -368,10 +368,46 @@ function validateShape(data, docType) {
   const required = REQUIRED_FIELDS[docType] || [];
   const missing = required.filter(k => !(k in data));
   if (missing.length > 0) {
-    console.warn(`[Shape] ${docType} missing fields: ${missing.join(', ')} — using defaults`);
-    // Fill missing required fields with 0 rather than failing
+    console.warn(JSON.stringify({ event: 'shape_missing', docType, missing }));
     missing.forEach(k => { data[k] = 0; });
   }
+
+  // Logical sanity bounds — catch impossible AI hallucinations before they hit tax calc
+  // These are hard upper limits; real Indian salaries/TDS won't exceed them
+  const BOUNDS = {
+    gross_salary: [0, 10_00_00_000],      // max 10 Cr salary
+    tds_deducted_form16: [0, 3_00_00_000], // TDS can't exceed 3 Cr for salaried
+    total_tds_26as: [0, 5_00_00_000],
+    salary_ais: [0, 10_00_00_000],
+    interest_income_ais: [0, 5_00_00_000],
+    ltcg_ais: [0, 50_00_00_000],           // allow large LTCG
+    stcg_ais: [0, 50_00_00_000],
+  };
+
+  const warnings = [];
+  for (const [field, [min, max]] of Object.entries(BOUNDS)) {
+    if (field in data && (data[field] < min || data[field] > max)) {
+      warnings.push(`${field}=${data[field]} out of range [${min},${max}]`);
+      data[field] = 0; // zero out impossible values rather than crashing
+    }
+  }
+
+  // Cross-field logic check: TDS cannot exceed gross salary
+  if (docType === 'f16' && data.tds_deducted_form16 > data.gross_salary && data.gross_salary > 0) {
+    warnings.push(`tds_deducted_form16 (${data.tds_deducted_form16}) > gross_salary (${data.gross_salary}) — impossible`);
+    data.tds_deducted_form16 = 0;
+  }
+
+  // Flag extreme salary mismatch between AIS and Form 16 (caught here, reported as error later)
+  if (docType === 'ais' && data._f16SalaryRef > 0 && data.salary_ais > 0) {
+    const ratio = Math.max(data.salary_ais, data._f16SalaryRef) / Math.min(data.salary_ais, data._f16SalaryRef);
+    if (ratio > 5) warnings.push(`salary_ais vs Form16 ratio ${ratio.toFixed(1)}x — unusual mismatch`);
+  }
+
+  if (warnings.length > 0) {
+    console.warn(JSON.stringify({ event: 'logical_validation_warn', docType, warnings }));
+  }
+
   return data;
 }
 
@@ -383,7 +419,7 @@ async function callGemini(base64Pdf, prompt, originalBuffer) {
 
   // Circuit breaker check — fail fast if Gemini is clearly down
   if (cb.isOpen()) {
-    throw new Error('AI service temporarily unavailable (too many recent failures). Please try again in 60 seconds or fill manually.');
+    throw new Error('circuit: AI service temporarily unavailable (too many recent failures). Try again in 60 seconds or fill manually.');
   }
 
   // Check cache first (SHA256 of original PDF buffer)
@@ -392,37 +428,41 @@ async function callGemini(base64Pdf, prompt, originalBuffer) {
     const cached = cacheGet(hash);
     if (cached) {
       stats.cacheHit();
-      slog(req, 'info', 'cache_hit', { quota_remaining: dailyQuota.remaining() });
+      // Note: req not in scope here — use structured console.log instead
+      console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'cache_hit', quota_remaining: dailyQuota.remaining() }));
       return cached;
     }
-    // Will set cache after successful extraction (see below)
   }
 
   stats.cacheMiss();
-  // Two-pass approach: extract text first, then parse structured data
-  // ~60% fewer tokens, faster, less hallucination on structured output
+  // Two-pass: extract text first (cheap), then parse structured JSON (cheaper than raw PDF)
   try {
-    const ts = () => new Date().toISOString();
-    console.log(`[${ts()}] Extracting PDF text...`);
     const pdfText = await extractPdfText(base64Pdf);
-    console.log(`[${ts()}] PDF text extracted, length: ${pdfText.length} chars`);
+    // Immediately free the base64 buffer from memory after text extracted
+    base64Pdf = null;
 
     if (pdfText.length < 100) {
-      // Scanned/image PDF — fall back to direct PDF approach
-      console.log(`[${ts()}] Short text, falling back to direct PDF extraction`);
-      return await callGeminiDirect(base64Pdf, prompt);
+      // Scanned/image PDF — fall back to direct extraction
+      console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'fallback_direct', reason: 'short_text' }));
+      const r = await callGeminiDirect(base64Pdf, prompt);
+      cb.onSuccess();
+      return r;
     }
 
     const result = await callGeminiText(pdfText, prompt);
-    if (originalBuffer) cacheSet(getCacheKey(originalBuffer), result);
-    cb.onSuccess(); // reset circuit breaker
+    if (originalBuffer) {
+      cacheSet(getCacheKey(originalBuffer), result);
+      originalBuffer = null; // free buffer memory immediately
+    }
+    cb.onSuccess();
     return result;
   } catch(e) {
-    console.error('Two-pass failed, trying direct PDF:', e.message);
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'two_pass_failed', err: e.message }));
     try {
-      const res = await callGeminiDirect(base64Pdf, prompt);
+      const r = await callGeminiDirect(base64Pdf, prompt);
       cb.onSuccess();
-      return res;
+      if (originalBuffer) { cacheSet(getCacheKey(originalBuffer), r); originalBuffer = null; }
+      return r;
     } catch(e2) {
       cb.onFailure();
       throw e2;
@@ -542,6 +582,15 @@ app.post(
     if (!files.f16 && !files.as26 && !files.ais) {
       return res.status(400).json({ error: 'Please upload at least one document.' });
     }
+
+    // Combined memory guard — prevent OOM on concurrent requests
+    // 8MB × 3 files × 10 concurrent users = 240MB; Render free tier = 512MB RAM
+    const totalSize = Object.values(files).flat().reduce((s, f) => s + f.size, 0);
+    if (totalSize > 12 * 1024 * 1024) {
+      slog(req, 'warn', 'upload_too_large', { total_kb: Math.round(totalSize/1024) });
+      return res.status(413).json({ error: `Total upload size (${Math.round(totalSize/1024/1024)}MB) exceeds 12MB. Use digital PDFs — scans are unnecessarily large.` });
+    }
+    slog(req, 'info', 'request_start', { docs: Object.keys(files).join(','), total_kb: Math.round(totalSize/1024), quota_remaining: dailyQuota.remaining() });
 
     const results = {
       f16Data: {},
@@ -702,6 +751,39 @@ function runErrorChecks(f16, as26, ais) {
       severity: 'blue'
     });
   }
+
+  // ── Edge case detection — complex situations requiring ITR-2 or CA ──────────
+  if ((ais.foreign_income || 0) > 0)
+    errors.push({
+      type:'crit', icon:'globe', severity:'red',
+      title:'Foreign Income Detected — ITR-2 Required',
+      desc:`AIS shows foreign income of ${fmt(ais.foreign_income)}. ITR-1 cannot be used.`,
+      action:'File ITR-2. DTAA exemptions and FBAR rules may apply — consult a CA.'
+    });
+
+  if ((ais.ltcg_ais + ais.stcg_ais) > 1_00_000)
+    errors.push({
+      type:'warn', icon:'chart', severity:'amber',
+      title:'Capital Gains May Require ITR-2',
+      desc:`LTCG: ${fmt(ais.ltcg_ais||0)}, STCG: ${fmt(ais.stcg_ais||0)}. ITR-1 covers salary + single house property only.`,
+      action:'If gains are from equity/mutual funds, use ITR-2. Verify with broker P&L.'
+    });
+
+  if (ais.mf_transactions > 0 && (ais.ltcg_ais||0) === 0 && (ais.stcg_ais||0) === 0)
+    errors.push({
+      type:'info', icon:'info', severity:'blue',
+      title:'Mutual Fund Activity — Capital Gains Not Reported',
+      desc:`AIS shows ${fmt(ais.mf_transactions)} in MF transactions but no capital gains detected.`,
+      action:"Download Capital Gains Statement from CAMS/Kfintech and verify before filing."
+    });
+
+  if (f16.special_allowance > 0 && f16.gross_salary > 0 && (f16.special_allowance / f16.gross_salary) > 0.4 && f16.special_allowance > 10_00_000)
+    errors.push({
+      type:'warn', icon:'briefcase', severity:'amber',
+      title:'Possible ESOP Perquisite in Salary',
+      desc:`Special allowance is ${Math.round((f16.special_allowance/f16.gross_salary)*100)}% of gross (${fmt(f16.special_allowance)}). This pattern often indicates ESOP vesting taxed as perquisite.`,
+      action:'Verify with Form 12BA from your employer. ESOP perquisites affect regime calculation.'
+    });
 
   return errors;
 }
