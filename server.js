@@ -84,7 +84,7 @@ app.use(cors({
   }
 }));
 
-app.use(express.json({ limit: '1mb' })); // prevent JSON body DoS attacks
+app.use(express.json({ limit: '25mb' })); // 25MB to handle base64-encoded PDFs in JSON
 
 // ── Structured logging middleware ────────────────────────────────────────────
 // Attaches req.id + req.startTime to every request for correlated logs
@@ -903,14 +903,49 @@ app.get('/stats', (req, res) => {
 
 // ── Main extraction endpoint ──────────────────────────────────────────────
 // Accepts up to 3 files: f16, as26, ais
+// ── JSON+base64 body → multer-compatible req.files shim ─────────────────────
+// Claude.ai artifact sandbox can't send FormData via postMessage (DataCloneError)
+// So frontend sends base64-encoded files as JSON instead
+// This middleware converts them into the same shape multer would produce
+function jsonToFiles(req, res, next) {
+  const ct = req.headers['content-type'] || '';
+  if (!ct.includes('application/json')) return next(); // multipart — let multer handle it
+  const body = req.body;
+  if (!body || typeof body !== 'object') return next();
+  req.files = {};
+  for (const key of ['f16', 'as26', 'ais']) {
+    const b64 = body[key];
+    if (!b64 || typeof b64 !== 'string') continue;
+    const buffer = Buffer.from(b64, 'base64');
+    req.files[key] = [{
+      fieldname: key,
+      originalname: key + '.pdf',
+      mimetype: 'application/pdf',
+      buffer,
+      size: buffer.length,
+    }];
+  }
+  next();
+}
+
+// Flexible upload handler: JSON or multipart
+function flexUpload(req, res, next) {
+  const ct = req.headers['content-type'] || '';
+  if (ct.includes('application/json')) {
+    jsonToFiles(req, res, next);
+  } else {
+    upload.fields([
+      { name: 'f16', maxCount: 1 },
+      { name: 'as26', maxCount: 1 },
+      { name: 'ais', maxCount: 1 },
+    ])(req, res, next);
+  }
+}
+
 app.post(
   '/extract',
   rateLimit,
-  upload.fields([
-    { name: 'f16', maxCount: 1 },
-    { name: 'as26', maxCount: 1 },
-    { name: 'ais', maxCount: 1 },
-  ]),
+  flexUpload,
   async (req, res) => {
     if (!process.env.GEMINI_API_KEY) {
       return res.status(500).json({ error: 'Server not configured. Contact support.' });
