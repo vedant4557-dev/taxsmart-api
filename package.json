@@ -1,7 +1,7 @@
 {
   "name": "taxsmart-api",
-  "version": "1.0.0",
-  "description": "TaxSmart backend \u2014 secure document extraction for Indian tax data",
+  "version": "2.0.0",
+  "description": "TaxSmart backend — secure document extraction for Indian tax data",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
