@@ -6,8 +6,8 @@ services:
     buildCommand: npm install
     startCommand: node server.js
     envVars:
-      - key: ANTHROPIC_API_KEY
-        sync: false       # You set this manually in Render dashboard
+      - key: GEMINI_API_KEY
+        sync: false       # Set this manually in Render dashboard → Environment
       - key: NODE_ENV
         value: production
     healthCheckPath: /health
